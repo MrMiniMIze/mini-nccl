@@ -105,6 +105,19 @@ class Staging:
 
     # ---- copies ----------------------------------------------------------
 
+    def order_copies_after_compute(self) -> None:
+        """Make the copy stream wait for work already queued on the compute stream.
+
+        Required, and not obvious: a ring step's reduction runs on the compute
+        stream, and the *next* step copies that same block off the device on the
+        copy stream. Without this dependency the copy is free to read the block
+        before the addition has landed, and the peer receives a partially
+        reduced value. That failure is invisible on CPU, where the streams are
+        no-ops, and it showed up on the first real GPU run.
+        """
+        if self.accelerated:
+            self.stream.wait_stream(torch.cuda.current_stream())
+
     def start_copy_out(self, slot: _Slot, source: torch.Tensor) -> None:
         """Begin device -> host for ``source`` into ``slot.send``."""
         view = slot.send[: source.numel()]
@@ -167,6 +180,11 @@ def _staged_exchange(
     """
     ranges = staging.ranges(send_device.numel())
     slots = staging.slots
+
+    # Everything this exchange reads off the device was produced by the
+    # compute stream (the caller's data, or the previous step's reduction), so
+    # the copy stream has to be ordered behind it exactly once, here.
+    staging.order_copies_after_compute()
 
     def issue(index: int) -> None:
         lo, hi = ranges[index]

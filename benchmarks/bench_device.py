@@ -84,6 +84,14 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=8)
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--chunk-bytes", type=int, default=4 * 1024 * 1024)
+    ap.add_argument(
+        "--channels",
+        type=int,
+        default=1,
+        help="sockets per peer. Defaults to 1 so that pipelined (single socket) "
+        "and staged are compared on equal footing; the staged path would "
+        "otherwise also gain the CPU collective's channel parallelism.",
+    )
     ap.add_argument("--cpu", action="store_true", help="force CPU tensors")
     ap.add_argument("--output", default="benchmarks/results/device.csv")
     args = ap.parse_args()
@@ -105,7 +113,7 @@ def main() -> None:
     numels = [mb * 2**20 // 4 for mb in SIZES_MB]
     per_rank = mn.run(
         _worker, args.world_size, numels, args.iters, args.warmup, use_cuda,
-        args.chunk_bytes, timeout=3600.0,
+        args.chunk_bytes, timeout=3600.0, n_channels=args.channels,
     )
 
     merged = []
@@ -132,7 +140,10 @@ def main() -> None:
 
     lookup = {(n, v): (s, e) for n, v, s, e in merged}
     label = "cuda" if use_cuda else "cpu"
-    print(f"\nall-reduce of {label} tensors, world_size={args.world_size}\n")
+    print(
+        f"\nall-reduce of {label} tensors, world_size={args.world_size}, "
+        f"{args.channels} channel(s), {args.chunk_bytes // 1024} KiB chunks\n"
+    )
     print("| size | naive | staged (pinned) | pipelined | pipelined vs staged |")
     print("|---|---|---|---|---|")
     for numel in numels:

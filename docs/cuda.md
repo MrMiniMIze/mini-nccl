@@ -28,59 +28,88 @@ Three details separate the fast version from the slow one:
    CUDA events, so the copy engine and the CPU writing to the socket run at
    once rather than taking turns.
 
-## Why this is the interesting case for the pipelining question
+## Results on an RTX 2070
 
-The chunked-overlap idea already appears in this repo for CPU tensors, and it
-**lost** there: 5-40% slower on loopback TCP (see the ablation table in the
-README), because "the network" on loopback is a memory copy performed by the
-very cores that would be doing the copying. There is nothing to overlap when
-both halves want the same hardware.
+### Pinned staging is a real win
 
-A device tensor is the case the optimization was always designed for. The copy
-engine is separate silicon from the CPU running the socket write, so the two
-can genuinely proceed in parallel. `benchmarks/bench_device.py` is set up to
-answer whether that holds, and it prints the CPU null result too, which is
-worth seeing side by side:
+`bench_copy_ceiling.py` measures the two halves separately:
 
-```
-all-reduce of cpu tensors, world_size=2
+| size | D2H pinned | H2D pinned | D2H pageable |
+|---|---|---|---|
+| 4 MiB | 10.9 GB/s | 10.5 GB/s | 4.9 GB/s |
+| 16 MiB | 11.2 GB/s | 11.3 GB/s | 6.5 GB/s |
+| 64 MiB | 10.5 GB/s | 11.3 GB/s | 6.5 GB/s |
 
-| size | naive | staged (pinned) | pipelined | pipelined vs staged |
+Pinned host memory is worth about **1.7x on the copy**, which is exactly what
+the mechanism is for: pageable memory cannot be DMA'd, so the driver stages it
+through its own pinned buffer and pays for an extra copy along the way.
+
+### Pipelining those copies cannot pay here, and the bound says why
+
+PCIe moves 11 GB/s. The loopback transport moves about 0.5 GB/s. So the copy is
+a small fraction of the total, and since pipelining can only hide the copy,
+that fraction is the entire prize:
+
+| size | copy round trip | network time | copy share | ceiling on pipelining |
 |---|---|---|---|---|
-| 16 MiB | 67.3 ms | 58.2 ms | 127.3 ms | 0.46x |
-| 64 MiB | 207.2 ms | 150.4 ms | 458.2 ms | 0.33x |
-```
+| 4 MiB | 0.7 to 0.9 ms | 8 ms | 8.6 to 10.2% | **1.09 to 1.11x** |
+| 16 MiB | 2.8 to 3.4 ms | 31 ms | 8.2 to 9.9% | **1.09 to 1.11x** |
+| 64 MiB | 11.4 to 13.2 ms | 125 ms | 8.4 to 9.5% | **1.09 to 1.11x** |
 
-On CPU the pipelined path pays for two extra passes over the data and buys
-nothing, exactly as predicted. The prediction to test on a GPU is that the last
-column crosses 1.0.
+(Two runs, shown as a range, because the run-to-run variance on a display GPU
+is larger than the difference being discussed.)
 
-## What is verified, and what is not
+Measured end to end, the pipelined path lands between 0.44x and 1.35x against
+pinned staging, below its own ~1.1x ceiling once per-chunk overhead and
+run-to-run variance are accounted for. This machine is a laptop GPU driving a
+display under WDDM with both ranks sharing it, so the variance is large; but the
+ceiling calculation does not depend on any of that. **No chunk size fixes a 10%
+ceiling**, which makes this a structural result rather than a tuning failure.
 
-Being precise about this, because it is the difference between a measurement
-and a hope:
+The useful part is the condition it implies. Pipelining rewards *balanced*
+stages: at 100 Gb/s (12.5 GB/s) a fabric is within 15% of PCIe, the copy share
+approaches half, and the ceiling approaches 2x. That is why NCCL pipelines
+aggressively on the hardware it targets, and why the same idea measured
+*negative* on loopback with CPU tensors (0.59x to 0.95x, see the README's
+ablation table). The technique is not wrong; the ratio it needs is absent here.
 
-- **Verified on CPU** (`tests/test_device.py`, runs in CI): the chunking covers
-  the payload exactly with no gaps or overlaps, the double-buffered pipeline
-  produces the same answer as the plain ring for chunk sizes from 64 bytes to
-  1 MiB, payloads smaller than one chunk work, and non-contiguous input is
-  rejected. All the control flow is shared between the CPU and CUDA paths, so
-  this is the bulk of the logic.
-- **Verified without a device**: the CUDA API surface the code calls (`Stream`,
-  `Event`, `record`, `synchronize`, `wait_event`, `pin_memory=`,
-  `non_blocking=`) exists in the installed torch. Shallow, but it catches the
-  failure mode that actually bites untested code.
-- **Not verified**: actual execution on a GPU. The machine this was developed
-  on has an RTX 2070 with a 2020-era driver (451.67, CUDA 11.0 maximum), and
-  every PyTorch CUDA build for Python 3.14 requires CUDA 12.6+, which needs
-  driver 527 or newer. Two tests in `tests/test_device.py` cover the device
-  path and currently skip. They are the check to run first once a GPU is
-  available.
+## The bug a GPU found immediately
 
-## Enabling it
+Worth recording, because it is the argument for running the device tests rather
+than trusting the CPU ones.
 
-**1. Update the NVIDIA driver** (needs administrator rights and a reboot).
-Anything 527 or newer works; current drivers fully support Turing. Confirm with:
+The pipeline logic is shared between the CPU and CUDA paths, and all of it
+passed on CPU, where CUDA streams are no-ops. The first execution on a real GPU
+failed within seconds: a ring step's reduction is queued on the **compute**
+stream, while the next step copies that same block off the device on the
+**copy** stream, and nothing ordered the two. The copy was free to read the
+block before the addition landed, so the peer received a partially reduced
+value. Rank 0 saw 2.0 where it expected 3.0, precisely the un-reduced number.
+
+The fix is one `wait_stream` per exchange (`Staging.order_copies_after_compute`).
+The class of bug (a missing cross-stream dependency) is invisible to any test
+that runs without a device.
+
+## What is verified
+
+- **On CPU, in CI** (`tests/test_device.py`): chunking covers the payload with
+  no gaps or overlaps, the double-buffered pipeline agrees with the plain ring
+  for chunk sizes from 64 bytes to 1 MiB, sub-chunk payloads work,
+  non-contiguous input is rejected, and every CUDA API the code calls exists in
+  the installed torch.
+- **On a GPU** (`nvidia-smi` driver 610.88, CUDA 12.6 build of torch, RTX 2070
+  sm_75): all 12 device tests pass with nothing skipped. Both device paths produce
+  the correct result for payloads from 1 element to 250k, and the staging really
+  is pinned with a separate stream and two buffer slots.
+- **Not verified**: anything about multi-GPU performance, and any comparison
+  against NCCL. The `nccl` backend in `torch.distributed` is Linux-only, so that
+  comparison needs a rented Linux box, one GPU per rank.
+
+## Enabling it elsewhere
+
+**1. Update the NVIDIA driver** (needs administrator rights, and usually a
+reboot). Anything 527 or newer works; current drivers fully support Turing.
+Confirm with:
 
 ```
 nvidia-smi
@@ -95,12 +124,24 @@ pip install --force-reinstall torch --index-url https://download.pytorch.org/whl
 python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
 ```
 
-**3. Run the tests that were skipping**, then the benchmark:
+**3. Run the tests that were skipping**, then the benchmarks:
 
 ```
 pytest tests/test_device.py -v
-python benchmarks/bench_device.py --world-size 2
+python benchmarks/bench_copy_ceiling.py --transport-gbps 0.5
+python benchmarks/bench_device.py --world-size 2 --channels 1
 ```
+
+Run `bench_copy_ceiling.py` before drawing conclusions from
+`bench_device.py`. It tells you what the ceiling on pipelining is for *your*
+copy and transport bandwidths, and therefore whether a disappointing result is
+worth chasing. Pass your own transport number: the default 0.5 GB/s is what the
+loopback ring in this repo measures, and a real fabric will be different.
+
+`bench_device.py` defaults to one channel so the pipelined path (single socket)
+and the staged path are compared on equal footing; the staged path would
+otherwise also pick up the CPU collective's channel parallelism, which has
+nothing to do with pipelining.
 
 ## What a single GPU can and cannot tell you
 

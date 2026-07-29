@@ -31,7 +31,7 @@ loopback hides](#what-loopback-teaches-and-what-it-hides).
 | Layer | File | What it does |
 |---|---|---|
 | Transport | `mini_nccl/transport.py` | Full-mesh TCP rendezvous, N connections per peer ("channels"), zero-copy receives straight into tensor storage, bounded operation timeouts |
-| Device path | `mini_nccl/device.py` | Pinned host staging, CUDA streams and events, chunked copy/network pipeline for accelerator tensors |
+| Device path | `mini_nccl/device.py` | Pinned host staging (1.7x on the copy), CUDA streams and events, chunked copy/network pipeline for accelerator tensors |
 | Process group | `mini_nccl/process_group.py` | `send` / `recv` / full-duplex `send_recv` / sliced `send_recv`: the primitives everything else is built from |
 | Collectives | `mini_nccl/collectives.py` | `all_reduce` (ring, tree, halving-doubling, naive), `reduce_scatter`, `all_gather`, `broadcast`, `all_to_all`, `barrier`, optional narrow wire dtype |
 | DDP | `mini_nccl/ddp.py` | Gradient bucketing, grads-as-bucket-views, overlap on a reducer thread, `no_sync()` accumulation |
@@ -357,33 +357,41 @@ tensor-parallel GPT reports the same loss on all four ranks to the last bit
 
 ### What loopback teaches, and what it hides
 
-Three separate optimizations in this repo should each be a win, and measured
+Four separate optimizations in this repo should each be a win, and measured
 here none of them is:
 
-| optimization | expected | measured on loopback |
+| optimization | expected | measured |
 |---|---|---|
 | comm/compute overlap in DDP | hide reduction behind backward | **+2%** |
 | slice pipelining inside a ring step | reduce slice *i* while *i+1* arrives | **0.59x to 0.95x** |
 | bfloat16 wire (half the bytes) | up to 2x on bandwidth-bound sizes | **0.95x to 1.28x** |
+| chunk pipelining of GPU staging copies | hide PCIe copies behind the network | **~1.1x ceiling** (measured bound) |
 
-They fail for one reason, which is worth more than any of the individual
-numbers: **on loopback the transport is not the bottleneck, the CPU is.**
-"Sending" a tensor to another process on the same machine is a memory copy
-performed by the same cores that run the reduction. Every one of these three
-optimizations trades CPU work for wire bytes, or assumes the transfer proceeds
-on hardware the compute is not using. Both assumptions are false here, so
-halving the bytes buys nothing and the extra casts and thread handoffs cost
-real time.
+They fail for one reason, worth more than any of the individual numbers:
+**loopback TCP is so slow relative to everything else that it is always the
+bottleneck.** "Sending" a tensor to another process on the same machine is a
+memory copy performed by the same cores that run the reduction. Every one of
+these optimizations either trades CPU work for wire bytes or tries to overlap
+the transfer with something else, and both moves need the transfer to be the
+expensive part. It is not: it is ~0.5 GB/s against 11 GB/s of PCIe and far more
+of DRAM.
 
-The same reasoning predicts all three flip on a real fabric, where a byte on
-the wire costs orders of magnitude more than a byte in DRAM and a NIC's DMA
-engine genuinely runs while the CPU computes. That prediction is falsifiable
-and `docs/multinode.md` lists exactly how to test it. Keeping the mechanisms
-in the code but defaulting them off is the honest response: the code is ready
-for the hardware it was designed for, and the defaults suit the hardware it
-actually runs on.
+The GPU case is the one where this stops being an argument and becomes
+arithmetic. Because the copy is measurably under 10% of the total, the ceiling
+on hiding it is about 1.1x, full stop. That reframes the other three: they are
+not mysterious disappointments, they are the same imbalance showing up in
+different places.
 
-### Device tensors: pinned staging and a copy/network pipeline
+The same reasoning says what would change the answer, and it is specific:
+pipelining rewards *balanced* stages, so a fabric within an order of magnitude
+of PCIe bandwidth (100 Gb/s InfiniBand is within 15%) moves the ceiling from
+1.1x toward 2x. That is a falsifiable prediction, `docs/multinode.md` says how
+to test it, and it is why NCCL pipelines aggressively on the hardware it
+targets. Keeping the mechanisms and defaulting them off is the honest response:
+the code is ready for the hardware it was designed for, and the defaults suit
+the hardware it runs on.
+
+### Device tensors: pinned staging, and a ceiling calculation
 
 A socket can only send host memory, so a tensor on an accelerator has to be
 staged through the host and back. `mini_nccl/device.py` does that three ways so
@@ -392,21 +400,49 @@ explicitly **pinned** host buffers so the copy engine can DMA directly, and as
 a ring on the device tensor with the payload **chunked** so chunk `k` is on the
 wire while chunk `k+1` is still being copied off the device.
 
-That third one is the case the pipelining idea was always meant for. It lost
-5-40% on CPU tensors because loopback's "network" is a memcpy on the same cores
-that would do the copying. A device copy engine is separate silicon from the
-CPU writing to the socket, so the two can genuinely overlap.
+Measured on an RTX 2070 (`bench_copy_ceiling.py`), the first optimization is a
+clear win and the second cannot be:
 
-**What is verified, stated precisely.** The chunking and double-buffering logic
-is shared between the CPU and CUDA paths and is tested on CPU in CI: exact
-payload coverage, agreement with the plain ring at chunk sizes from 64 bytes to
-1 MiB, payloads smaller than one chunk, non-contiguous rejection. A separate
-test checks that every CUDA API the code calls exists in the installed torch.
-**Execution on an actual GPU is not verified**: the development machine's
-driver is from 2020 (CUDA 11.0 maximum) and every PyTorch CUDA build for
-Python 3.14 needs CUDA 12.6+. Two tests cover the device path and currently
-skip; `docs/cuda.md` has the two commands that light them up, and the CPU null
-result to compare against.
+| size | D2H pinned | H2D pinned | D2H **pageable** |
+|---|---|---|---|
+| 16 MiB | 11.2 GB/s | 11.3 GB/s | 6.5 GB/s |
+| 64 MiB | 10.5 GB/s | 11.3 GB/s | 6.5 GB/s |
+
+**Pinned staging is worth 1.7x on the copy itself** (2.2x at 4 MiB), which is
+the whole reason it exists: pageable host memory cannot be DMA'd, so the driver
+stages it through its own pinned buffer and pays for an extra copy.
+
+The pipelining is a different story, and the interesting one. PCIe moves 11 GB/s
+while the loopback transport moves about 0.5 GB/s, so the copy is only **8 to
+10%** of the total time (two runs, to show the variance):
+
+| size | copy round trip | network time | copy share | **ceiling on pipelining** |
+|---|---|---|---|---|
+| 4 MiB | 0.7 to 0.9 ms | 8 ms | 8.6 to 10.2% | **1.09 to 1.11x** |
+| 16 MiB | 2.8 to 3.4 ms | 31 ms | 8.2 to 9.9% | **1.09 to 1.11x** |
+| 64 MiB | 11.4 to 13.2 ms | 125 ms | 8.4 to 9.5% | **1.09 to 1.11x** |
+
+Pipelining can only hide the copy, so the copy's share is the entire prize. The
+ceiling is about 1.1x, and the measured result (0.44x to 1.35x, dominated by
+per-chunk overhead and run-to-run variance) sits below it. That is a
+**structural** result rather than a tuning failure: no chunk size fixes a 10%
+ceiling.
+
+It also says exactly when the optimization does pay, which is the part that
+generalizes. Pipelining rewards *balanced* stages. At 100 Gb/s (12.5 GB/s) the
+fabric and PCIe are within 15% of each other, the copy share approaches half,
+and the ceiling approaches 2x. That is why NCCL pipelines: on the fabrics it
+targets, the two stages actually are balanced. Loopback TCP is 22x slower than
+PCIe, so nothing about it is.
+
+**A bug worth mentioning.** The device path was written and its logic tested on
+CPU, where CUDA streams are no-ops. The first run on a real GPU failed
+immediately: a ring step's reduction runs on the compute stream while the next
+step's copy reads that same block on the copy stream, and nothing ordered the
+two. Rank 0 received 2.0 where it expected 3.0, exactly the un-reduced value.
+The fix is one `wait_stream` per exchange. No amount of CPU testing would have
+found it, which is the argument for the two device tests that only run when a
+GPU is present.
 
 ### Low precision: the error is in the hops, not the accumulator
 
@@ -554,9 +590,12 @@ to a win.
 
 ## Limitations (deliberate)
 
-- **The device path is unmeasured.** Pinned staging and the copy/network
-  pipeline are implemented and their logic is tested on CPU, but no GPU has run
-  them (see `docs/cuda.md`). Treat that code as reviewed, not benchmarked.
+- **The device path is verified on one GPU, not measured across several.**
+  Correctness is tested on an RTX 2070 and the copy-bandwidth ceiling is
+  measured, but both ranks share a single display GPU under WDDM, so the
+  end-to-end timings are noisy and say nothing about multi-GPU scaling. No
+  comparison against NCCL itself: the `nccl` backend in `torch.distributed` is
+  Linux-only. See `docs/cuda.md`.
 - **A process group is not thread-safe per channel.** Collectives must be
   issued in identical order on every rank, so callers serialize per channel.
   This is NCCL's contract too, and the DDP reducer is built around it.
