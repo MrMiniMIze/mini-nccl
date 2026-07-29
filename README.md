@@ -623,9 +623,11 @@ to a win.
 - Chunk pipelining *across* ring steps (independent chunks flowing through
   the ring simultaneously, rather than slicing within one step), which is how
   gloo takes the 64 MiB 4-rank case.
-- Measure the device path on real GPUs, one per rank, against NCCL itself
-  through `torch.distributed`. That is where the three optimizations that lost
-  on loopback should finally pay.
+- Measure the device path with **one GPU per rank** (it is correctness-verified
+  on a single shared GPU today) and compare against **NCCL itself** through
+  `torch.distributed`, which needs a Linux box since that backend is Linux-only.
+  A fabric fast enough to balance against PCIe is also the setting where the
+  four optimizations that lost on loopback should finally pay.
 - Error feedback for low-precision reduction, carrying the per-hop rounding
   residual forward so ring's accuracy stops degrading with world size.
 - The general non-power-of-two halving-doubling with the remainder fold-in.
