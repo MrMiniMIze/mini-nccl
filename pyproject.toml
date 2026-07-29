@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mini-nccl"
-version = "0.1.0"
-description = "A from-scratch collective communications library (ring/tree all-reduce, reduce-scatter, all-gather) with a bucketed-overlap DDP built on top of it"
+version = "0.3.0"
+description = "A from-scratch collective communications library (ring, tree, and halving-doubling all-reduce over raw TCP) with data-parallel, fully-sharded, and tensor-parallel training built on top of it"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "MrMiniMIze" }]

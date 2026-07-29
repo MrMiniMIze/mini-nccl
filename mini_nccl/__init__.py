@@ -1,9 +1,12 @@
-"""mini-nccl: collective communication from first principles.
+"""mini-nccl: distributed training from first principles.
 
 A small, readable reimplementation of the algorithms inside libraries like
 NCCL (ring, binomial-tree, and recursive halving-doubling all-reduce,
 reduce-scatter, all-gather, broadcast, all-to-all) over plain TCP sockets,
-plus a bucketed-overlap DDP wrapper built on nothing but these primitives.
+plus three parallelism strategies built on nothing but those primitives:
+``DistributedDataParallel`` (bucketed, overlapped),
+``FullyShardedDataParallel`` (sharded parameters and optimizer state), and the
+column/row parallel layers in ``tensor_parallel``.
 
 Typical usage inside a worker process::
 
@@ -62,7 +65,7 @@ __all__ = [
     "run",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 _group: ProcessGroup | None = None
 
@@ -140,8 +143,15 @@ def destroy_process_group() -> None:
         _group = None
 
 
-def all_reduce(tensor: torch.Tensor, op: str = "sum", algorithm: str = "auto") -> torch.Tensor:
-    return _c.all_reduce(get_group(), tensor, op=op, algorithm=algorithm)
+def all_reduce(
+    tensor: torch.Tensor,
+    op: str = "sum",
+    algorithm: str = "auto",
+    wire_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return _c.all_reduce(
+        get_group(), tensor, op=op, algorithm=algorithm, wire_dtype=wire_dtype
+    )
 
 
 def broadcast(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
