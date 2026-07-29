@@ -103,13 +103,41 @@ def _split(flat: torch.Tensor, n_parts: int) -> list[torch.Tensor]:
     return parts
 
 
+#: Dtypes too narrow to accumulate a sum of many terms without losing it.
+LOW_PRECISION = (torch.bfloat16, torch.float16)
+
+
 def all_reduce(
     pg: ProcessGroup,
     tensor: torch.Tensor,
     op: str = "sum",
     algorithm: str = "auto",
+    wire_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """In-place all-reduce of ``tensor`` across all ranks."""
+    """In-place all-reduce of ``tensor`` across all ranks.
+
+    ``wire_dtype`` separates the precision carried between ranks from the
+    precision the sum is accumulated in, the standard arrangement for
+    large-model gradient reduction:
+
+    - ``float32`` tensor, ``wire_dtype=torch.bfloat16``: halves the bytes on
+      the wire, with every addition still performed in float32.
+    - ``bfloat16`` tensor, ``wire_dtype=torch.bfloat16``: same bytes, but the
+      running sum is promoted to float32 explicitly rather than relying on
+      PyTorch's kernels to widen internally.
+
+    A measured caveat, because it is the opposite of what the name suggests:
+    widening the accumulator does **not** measurably improve a bfloat16
+    reduction here (see tests/test_low_precision.py). The error is dominated
+    by rounding the partial sum back onto the narrow wire at every hop, so it
+    scales with hop count, not accumulator width. That makes the *algorithm*
+    the real lever on low-precision accuracy: tree crosses O(log W) hops and
+    holds its error roughly constant in W, while ring crosses O(W) and grows
+    linearly. Low precision therefore inverts the usual ranking, since ring is
+    the bandwidth-optimal choice but the least accurate one.
+
+    Supported for the ``ring`` and ``tree`` algorithms.
+    """
     _check_op(op)
     if pg.world_size == 1:
         return tensor
@@ -121,33 +149,71 @@ def all_reduce(
         # the honest fallback rather than a silently different algorithm.
         algorithm = "ring"
 
-    ev = pg.recorder.start("all_reduce", algorithm, channel=-1, nbytes=nbytes, op=op)
+    if wire_dtype is not None:
+        if algorithm not in ("ring", "tree"):
+            raise ValueError(f"wire_dtype is implemented for ring and tree, not {algorithm!r}")
+        if wire_dtype.itemsize > tensor.element_size():
+            raise ValueError(
+                f"wire_dtype {wire_dtype} is wider than the tensor's {tensor.dtype}"
+            )
+        nbytes = tensor.numel() * wire_dtype.itemsize
+
+    ev = pg.recorder.start(
+        "all_reduce",
+        algorithm,
+        channel=-1,
+        nbytes=nbytes,
+        op=op,
+        wire=str(wire_dtype) if wire_dtype else "native",
+    )
     try:
+        # A narrow tensor gets a float32 working copy, so the accumulator is
+        # wide even though the input and output are not.
+        working = tensor
+        if wire_dtype is not None and tensor.dtype in LOW_PRECISION:
+            working = _flat(tensor).float()
+
         if algorithm == "ring":
             n_channels = _n_channels_for(pg, nbytes)
-            flat = _flat(tensor)
-            parts = _split(flat, n_channels)
+            parts = _split(_flat(working), n_channels)
             pg.run_per_channel(
-                [partial(_ring_on_channel, pg, part, op, c) for c, part in enumerate(parts)]
+                [
+                    partial(_ring_on_channel, pg, part, op, c, wire_dtype)
+                    for c, part in enumerate(parts)
+                ]
             )
         elif algorithm == "tree":
-            _binomial_reduce(pg, tensor, op, root=0)
-            _binomial_broadcast(pg, tensor, root=0)
+            _binomial_reduce(pg, working, op, root=0, wire_dtype=wire_dtype)
+            _binomial_broadcast(pg, working, root=0, wire_dtype=wire_dtype)
         elif algorithm == "halving":
-            _halving_doubling(pg, tensor, op)
+            _halving_doubling(pg, working, op)
         elif algorithm == "naive":
-            _naive_all_reduce(pg, tensor, op)
+            _naive_all_reduce(pg, working, op)
         else:
             raise ValueError(f"unknown algorithm {algorithm!r}")
+
+        if working is not tensor:
+            _flat(tensor).copy_(working)
     finally:
         pg.recorder.finish(ev)
     return tensor
 
 
 def _ring_on_channel(
-    pg: ProcessGroup, segment: torch.Tensor, op: str, channel: int
+    pg: ProcessGroup,
+    segment: torch.Tensor,
+    op: str,
+    channel: int,
+    wire_dtype: torch.dtype | None = None,
 ) -> None:
-    """Full ring all-reduce of one segment, entirely on one channel."""
+    """Full ring all-reduce of one segment, entirely on one channel.
+
+    With ``wire_dtype`` set, every hop casts down to send and back up to
+    accumulate, so the blocks stay in the segment's (wider) dtype throughout.
+    Each hop re-rounds the partial sum, which is the price of a narrow wire;
+    what it buys is that the arithmetic itself never happens in the narrow
+    type.
+    """
     W, r = pg.world_size, pg.rank
     flat = segment.view(-1)
     nbytes = flat.numel() * flat.element_size()
@@ -165,6 +231,10 @@ def _ring_on_channel(
         right, left = (r + 1) % W, (r - 1) % W
         reduce_op = _OPS[op]
         n_slices = _n_slices_for(chunk * flat.element_size())
+        send_wire = recv_wire = None
+        if wire_dtype is not None:
+            send_wire = torch.empty(chunk, dtype=wire_dtype)
+            recv_wire = torch.empty(chunk, dtype=wire_dtype)
 
         # Phase 1 (reduce-scatter): after W-1 steps, this rank holds the
         # fully reduced block (r + 1) % W. Each step forwards the block we
@@ -174,21 +244,38 @@ def _ring_on_channel(
             send_idx = (r - step) % W
             recv_idx = (r - step - 1) % W
             target = blocks[recv_idx]
-            pg.send_recv_sliced(
-                blocks[send_idx],
-                right,
-                tmp,
-                left,
-                n_slices,
-                lambda start, end, t=target: reduce_op(t[start:end], tmp[start:end]),
-                channel,
-            )
+            if wire_dtype is None:
+                pg.send_recv_sliced(
+                    blocks[send_idx],
+                    right,
+                    tmp,
+                    left,
+                    n_slices,
+                    lambda start, end, t=target: reduce_op(t[start:end], tmp[start:end]),
+                    channel,
+                )
+            else:
+                send_wire.copy_(blocks[send_idx])
+                pg.send_recv(send_wire, right, recv_wire, left, channel)
+                if op == "sum":
+                    # Type promotion widens each element inside the add, so
+                    # this stays one pass over the data instead of a separate
+                    # widening copy followed by an add.
+                    target.add_(recv_wire)
+                else:
+                    tmp.copy_(recv_wire)
+                    reduce_op(target, tmp)
 
         # Phase 2 (all-gather): circulate the reduced blocks around the ring.
         for step in range(W - 1):
             send_idx = (r + 1 - step) % W
             recv_idx = (r - step) % W
-            pg.send_recv(blocks[send_idx], right, blocks[recv_idx], left, channel)
+            if wire_dtype is None:
+                pg.send_recv(blocks[send_idx], right, blocks[recv_idx], left, channel)
+            else:
+                send_wire.copy_(blocks[send_idx])
+                pg.send_recv(send_wire, right, recv_wire, left, channel)
+                blocks[recv_idx].copy_(recv_wire)
 
         if padded.data_ptr() != flat.data_ptr():
             flat.copy_(padded[: flat.numel()])
@@ -252,41 +339,81 @@ def _halving_doubling(pg: ProcessGroup, tensor: torch.Tensor, op: str) -> None:
         flat.copy_(padded[: flat.numel()])
 
 
-def _binomial_reduce(pg: ProcessGroup, tensor: torch.Tensor, op: str, root: int) -> None:
-    """Reduce onto ``root`` along a binomial tree (works for any world size)."""
+def _binomial_reduce(
+    pg: ProcessGroup,
+    tensor: torch.Tensor,
+    op: str,
+    root: int,
+    wire_dtype: torch.dtype | None = None,
+) -> None:
+    """Reduce onto ``root`` along a binomial tree (works for any world size).
+
+    This is where a wide accumulator pays most: an interior node adds up to
+    ``log2(W)`` incoming buffers into one running total, and the root's total
+    covers every rank. Accumulating that in the wire's narrow type would round
+    after every addition.
+    """
     W, r = pg.world_size, pg.rank
     vr = (r - root) % W  # virtual rank: the tree is always rooted at vr 0
     flat = _flat(tensor)
     tmp = torch.empty_like(flat)
     reduce_op = _OPS[op]
+    wire = torch.empty(flat.numel(), dtype=wire_dtype) if wire_dtype else None
 
     mask = 1
     while mask < W:
         if vr & mask:
             dst = ((vr & ~mask) + root) % W
-            pg.send(tensor, dst)
+            if wire is None:
+                pg.send(tensor, dst)
+            else:
+                wire.copy_(flat)
+                pg.send(wire, dst)
             return  # non-roots send exactly once, then are done
         src = vr | mask
         if src < W:
-            pg.recv(tmp, (src + root) % W)
-            reduce_op(flat, tmp)
+            if wire is None:
+                pg.recv(tmp, (src + root) % W)
+                reduce_op(flat, tmp)
+            elif op == "sum":
+                pg.recv(wire, (src + root) % W)
+                flat.add_(wire)  # promotion widens inside the add
+            else:
+                pg.recv(wire, (src + root) % W)
+                tmp.copy_(wire)
+                reduce_op(flat, tmp)
         mask <<= 1
 
 
-def _binomial_broadcast(pg: ProcessGroup, tensor: torch.Tensor, root: int) -> None:
+def _binomial_broadcast(
+    pg: ProcessGroup,
+    tensor: torch.Tensor,
+    root: int,
+    wire_dtype: torch.dtype | None = None,
+) -> None:
     W, r = pg.world_size, pg.rank
     if W == 1:
         return
+    flat = _flat(tensor)
+    wire = torch.empty(flat.numel(), dtype=wire_dtype) if wire_dtype else None
     vr = (r - root) % W
     if vr != 0:
         lowbit = vr & -vr
-        pg.recv(tensor, ((vr - lowbit) + root) % W)
+        parent = ((vr - lowbit) + root) % W
+        if wire is None:
+            pg.recv(tensor, parent)
+        else:
+            pg.recv(wire, parent)
+            flat.copy_(wire)
         mask = lowbit >> 1
     else:
         mask = 1 << ((W - 1).bit_length() - 1)
+    if wire is not None:
+        wire.copy_(flat)
     while mask:
         if vr + mask < W:
-            pg.send(tensor, ((vr + mask) + root) % W)
+            dst = ((vr + mask) + root) % W
+            pg.send(tensor if wire is None else wire, dst)
         mask >>= 1
 
 

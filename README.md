@@ -2,20 +2,29 @@
 
 [![ci](https://github.com/MrMiniMIze/mini-nccl/actions/workflows/ci.yml/badge.svg)](https://github.com/MrMiniMIze/mini-nccl/actions/workflows/ci.yml)
 
-**Collective communication from first principles.** A small, readable
+**Distributed training from first principles.** A small, readable
 reimplementation of the machinery inside libraries like NCCL: ring,
 binomial-tree, and recursive halving-doubling all-reduce, reduce-scatter,
 all-gather, broadcast, and all-to-all, built on nothing but TCP sockets and
-PyTorch tensors. On top of that sits a bucketed-overlap
-`DistributedDataParallel`, a flight recorder that turns a hung job into a
-named culprit, and a character-level GPT whose every gradient byte moves
-through this library rather than `torch.distributed`.
+PyTorch tensors. On top of those primitives sit three parallelism strategies
+written from scratch (data parallel, fully sharded, and tensor parallel), a
+flight recorder that turns a hung job into a named culprit, and a
+character-level GPT whose every gradient byte moves through this library.
 
 No `torch.distributed`, no MPI, no NCCL underneath. The goal is to make the
 machinery of distributed training small enough to read in an afternoon and
-measured well enough to trust, including where it loses.
+measured well enough to trust, including the three optimizations that
+measured *worse* here and the reason they all failed the same way.
 
 ![all-reduce bus bandwidth](docs/img/allreduce_busbw.png)
+
+**If you only read three files:** `collectives.py` for the algorithms,
+`ddp.py` for how gradients get reduced while backward is still running, and
+`fsdp.py` for how the same primitives shard a model too large to replicate.
+**If you only read three results:** [ring against
+gloo](#results), [the tuning ablation](#tuning-not-guessing-the-channel-ablation)
+where one optimization measured slower and therefore ships off, and [what
+loopback hides](#what-loopback-teaches-and-what-it-hides).
 
 ## What's inside
 
@@ -23,12 +32,14 @@ measured well enough to trust, including where it loses.
 |---|---|---|
 | Transport | `mini_nccl/transport.py` | Full-mesh TCP rendezvous, N connections per peer ("channels"), zero-copy receives straight into tensor storage, bounded operation timeouts |
 | Process group | `mini_nccl/process_group.py` | `send` / `recv` / full-duplex `send_recv` / sliced `send_recv`: the primitives everything else is built from |
-| Collectives | `mini_nccl/collectives.py` | `all_reduce` (ring, tree, halving-doubling, naive), `reduce_scatter`, `all_gather`, `broadcast`, `all_to_all`, `barrier` |
+| Collectives | `mini_nccl/collectives.py` | `all_reduce` (ring, tree, halving-doubling, naive), `reduce_scatter`, `all_gather`, `broadcast`, `all_to_all`, `barrier`, optional narrow wire dtype |
 | DDP | `mini_nccl/ddp.py` | Gradient bucketing, grads-as-bucket-views, overlap on a reducer thread, `no_sync()` accumulation |
+| FSDP | `mini_nccl/fsdp.py` | Parameter sharding, per-unit all-gather, reduce-scatter gradients, sharded optimizer state, measured memory accounting |
+| Tensor parallel | `mini_nccl/tensor_parallel.py` | Column/row parallel linear, head-split attention with fused-QKV row mapping, Megatron's two autograd functions |
 | Flight recorder | `mini_nccl/recorder.py`, `diagnose.py` | Sequence-numbered collective log, Perfetto traces, desync diagnosis |
 | Launcher | `mini_nccl/launcher.py` | `mn.run(fn, world_size)`: spawn, rendezvous, collect results, notice dead ranks |
-| Example | `examples/train_gpt.py` | Char-level GPT trained data-parallel through mini-nccl |
-| Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit |
+| Examples | `examples/` | Char-level GPT trained data-parallel, the same GPT under FSDP, a tensor-parallel GPT, and a diagnosed hang |
+| Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit, low-precision study |
 
 ## Quickstart
 
@@ -36,13 +47,16 @@ measured well enough to trust, including where it loses.
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 22 tests, world sizes 2-4
+pytest -q                                        # 37 tests, world sizes 2-8
 
 python examples/train_gpt.py --world-size 4 --steps 200 --sample
+python examples/train_gpt.py --world-size 4 --steps 200 --fsdp   # sharded
+python examples/tensor_parallel_gpt.py --world-size 4            # split layers
 python examples/desync_demo.py                   # a hang, diagnosed
 python benchmarks/bench_allreduce.py --world-sizes 2,4 --gloo
 python benchmarks/bench_ablation.py              # channel + pipeline tuning
 python benchmarks/fit_cost_model.py              # alpha-beta fit
+python benchmarks/bench_low_precision.py         # bfloat16 wire study
 ```
 
 The API mirrors `torch.distributed`:
@@ -251,13 +265,155 @@ processes with `1/W` of the batch each must produce the same parameters as
 single-process full-batch training, step for step, including with 1 KiB
 buckets, with overlap on and off, and across `no_sync()` boundaries.
 
-**What overlap buys here: about 2%.** That is the correct answer for this
-environment and worth understanding rather than hiding. Overlap pays when
-communication uses a resource distinct from compute (a NIC with DMA, a GPU
-copy engine). On loopback, the transfer *is* memcpy on the cores backward
-needs, so there is nothing independent to overlap with. The mechanism is what
-matters; the payoff appears when the transport stops sharing silicon with the
-model.
+**What overlap buys here: about 2%.** See
+[what loopback hides](#what-loopback-teaches-and-what-it-hides) below, which
+explains that number along with two other optimizations that measured no
+better.
+
+### FSDP: sharding the parameters themselves
+
+DDP replicates every parameter on every rank, so the model must fit in one
+rank's memory. `mini_nccl.FullyShardedDataParallel` splits them instead: rank
+`r` persistently holds `1/W` of each sharded parameter, and a unit's full
+parameters exist only for the moment they are used.
+
+- **Forward:** `all_gather` the unit's shards into a flat buffer, point the
+  module's parameters at views of it, run forward, release the buffer.
+- **Backward:** `all_gather` again, recompute the unit's forward with autograd
+  enabled, then `reduce_scatter` the gradients so each rank receives exactly
+  the slice matching its parameters.
+
+The optimizer only ever sees the local shards, so parameters, gradients, *and*
+optimizer state all scale as `1/W`. Both new collectives were already built
+and tested for their own sake, which is the payoff of having the primitives
+first: FSDP is mostly bookkeeping on top of `all_gather` and `reduce_scatter`.
+
+On the example GPT (4.8M parameters, 6 layers, 4 ranks):
+
+| | DDP | FSDP |
+|---|---|---|
+| parameter memory per rank | 18.20 MiB | **7.66 MiB** |
+| resident shards | n/a | 4.52 MiB |
+| replicated (embeddings, tied head) | n/a | 0.13 MiB |
+| peak transient gather | n/a | 3.01 MiB |
+| loss after 40 steps | 2.7794 | **2.7794** |
+
+The identical loss is the point: same arithmetic, different memory layout.
+Only one unit is gathered at a time, so the transient cost is one block rather
+than the whole model, and it does not grow with depth.
+
+**How this differs from PyTorch's FSDP.** Real FSDP re-gathers into the same
+storage it freed, so tensors autograd saved during forward become valid again
+once the storage is refilled. That is efficient but leans on storage-resize
+internals. Here the unit's forward is *recomputed* in backward instead, the
+same mechanism as activation checkpointing: it costs one extra forward per
+unit, saves activation memory as a side effect, and nothing depends on a freed
+tensor still being reachable. Embeddings, norms, and the tied head stay
+replicated and are all-reduced like DDP, mirroring a real transformer wrap
+policy and sidestepping the question of how to shard a tied weight.
+
+### Tensor parallel: splitting a single layer
+
+Data parallelism splits the batch; tensor parallelism splits the *layer*, so a
+matrix multiply too large for one device runs as several smaller ones. Megatron's
+observation is that a pair of linear layers can be split so the pair needs
+exactly one collective each way:
+
+- **Column parallel** on the first: each rank holds a slice of the output rows
+  and computes a slice of the activation from the full input. No forward
+  communication. Each rank's `dL/dx` is only a partial contribution, so
+  backward **all-reduces** the input gradient.
+- **Row parallel** on the second: each rank holds the input columns matching
+  the activation slice it already has, producing a partial sum. Forward
+  **all-reduces** those partials; backward needs nothing.
+
+Chained, the 4x-wide MLP activation is never gathered. The only two autograd
+functions needed are identity-forward/all-reduce-backward and its mirror,
+which Megatron calls `f` and `g`.
+
+Attention splits by head, since heads are independent. The subtlety is the
+fused QKV projection: its output is laid out `[all q | all k | all v]`, so a
+contiguous split would hand rank 0 every q head plus part of k, which is not a
+valid attention shard. `ColumnParallelLinear` therefore accepts an explicit
+row mapping, and attention passes the interleaved
+`q[my heads] ++ k[my heads] ++ v[my heads]`.
+
+Every layer is verified against an unsharded reference on outputs *and*
+gradients, because a misplaced `f`/`g` leaves forward looking perfect while
+training silently diverges.
+
+One property is worth calling out because it is easy to get wrong by accident.
+A tensor-parallel model does no data-parallel gradient sync, so replicated
+layers beside sharded ones stay in step only because every rank receives an
+identical activation gradient from the backward all-reduce. That holds
+*bitwise*: ring and tree all-reduce reduce each element on one rank and copy
+the result, rather than each rank summing in its own order. If it did not hold,
+replicas would drift apart silently over thousands of steps, so
+`tests/test_tensor_parallel.py` asserts exact equality. In practice the
+tensor-parallel GPT reports the same loss on all four ranks to the last bit
+(`max disagreement: 0.00e+00`).
+
+### What loopback teaches, and what it hides
+
+Three separate optimizations in this repo should each be a win, and measured
+here none of them is:
+
+| optimization | expected | measured on loopback |
+|---|---|---|
+| comm/compute overlap in DDP | hide reduction behind backward | **+2%** |
+| slice pipelining inside a ring step | reduce slice *i* while *i+1* arrives | **0.59x to 0.95x** |
+| bfloat16 wire (half the bytes) | up to 2x on bandwidth-bound sizes | **0.95x to 1.28x** |
+
+They fail for one reason, which is worth more than any of the individual
+numbers: **on loopback the transport is not the bottleneck, the CPU is.**
+"Sending" a tensor to another process on the same machine is a memory copy
+performed by the same cores that run the reduction. Every one of these three
+optimizations trades CPU work for wire bytes, or assumes the transfer proceeds
+on hardware the compute is not using. Both assumptions are false here, so
+halving the bytes buys nothing and the extra casts and thread handoffs cost
+real time.
+
+The same reasoning predicts all three flip on a real fabric, where a byte on
+the wire costs orders of magnitude more than a byte in DRAM and a NIC's DMA
+engine genuinely runs while the CPU computes. That prediction is falsifiable
+and `docs/multinode.md` lists exactly how to test it. Keeping the mechanisms
+in the code but defaulting them off is the honest response: the code is ready
+for the hardware it was designed for, and the defaults suit the hardware it
+actually runs on.
+
+### Low precision: the error is in the hops, not the accumulator
+
+Sending gradients as bfloat16 is standard practice for large models, and
+`all_reduce(..., wire_dtype=torch.bfloat16)` separates the precision on the
+wire from the precision the sum is accumulated in. Measuring it produced a
+result I did not expect, and the negative half is the more useful half.
+
+The framing everyone reaches for is "accumulate in float32 so small gradients
+are not lost." bfloat16 carries 8 mantissa bits, so once a running sum reaches
+1.0 it cannot represent anything below about 1/256. The test case makes that
+concrete: rank 0 contributes 1.0 and every other rank contributes 0.004, which
+sits right at the rounding threshold.
+
+Widening the accumulator changed the answer by **exactly nothing**, because
+PyTorch's CPU bfloat16 kernels already compute in float32 and round on store.
+What does matter is how many times the partial sum is rounded back onto the
+narrow wire, which is a property of the *algorithm*:
+
+| world size | exact | ring (bf16 wire) | tree (bf16 wire) |
+|---|---|---|---|
+| 4 | 1.012 | 1.0234 (err 0.011) | 1.0156 (err 0.0036) |
+| 8 | 1.028 | 1.0547 (err 0.027) | 1.0313 (err 0.0033) |
+| 16 | 1.060 | 1.1172 (err 0.057) | 1.0625 (err 0.0025) |
+
+Ring's error grows linearly with world size because the partial crosses `O(W)`
+hops and is re-rounded at each one. Tree's stays nearly flat because it crosses
+`O(log W)`. At 16 ranks tree is **20x more accurate**, which inverts the usual
+ranking: ring moves the fewest bytes and is the least accurate way to do it.
+
+So the explicit float32 accumulator is insurance rather than a fix (it does not
+depend on a kernel happening to widen internally), and the real lever on
+low-precision accuracy is algorithm choice. That is not a conclusion available
+from reasoning about mantissa bits; it needed the measurement.
 
 ## Reliability: a hang you can debug
 
@@ -331,7 +487,7 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q     # 22 tests, ~95 s (process spawn dominates)
+pytest -q     # 37 tests, ~3.5 min (process spawn dominates)
 ```
 
 - **Collectives:** every collective x every algorithm x sum/max/min/prod x
@@ -341,6 +497,14 @@ pytest -q     # 22 tests, ~95 s (process spawn dominates)
   seeds. Plus explicit single-channel and all-channels-in-use cases.
 - **DDP:** parity against single-process training (overlap on/off,
   multi-bucket, `no_sync()` accumulation), and initial-weight broadcast.
+- **FSDP:** the reassembled model must match single-process training step for
+  step; sharding must actually cut resident and optimizer memory; the
+  transient gather must stay one unit's worth.
+- **Tensor parallel:** outputs *and* gradients against an unsharded reference
+  for the MLP and for attention with fused-QKV row mapping, and replicated
+  layers must stay bitwise identical across ranks.
+- **Low precision:** ring's error grows with world size while tree's does not,
+  and a narrow wire still moves the right bits.
 - **Transport:** full-duplex ring rotation deadlock test, zero-copy
   invariants.
 - **Faults:** a rank dying mid-collective must surface in seconds; a desync
@@ -372,34 +536,44 @@ to a win.
 - **Halving-doubling needs a power-of-two world size** and falls back to ring
   otherwise.
 - **No unused-parameter detection in DDP**, matching PyTorch's default.
+- **FSDP units must take one tensor and return one tensor** (the shape of a
+  transformer block), and it recomputes rather than refilling freed storage.
+- **Tensor parallel has no vocab-parallel embedding**, so embeddings and the
+  tied head stay replicated.
+- **No pipeline parallelism.** Of the four strategies, the 1F1B schedule is
+  the one still missing.
 - Equal tensor shapes are required on all ranks, as in NCCL.
 
 ## Roadmap
 
+- Pipeline parallelism with a 1F1B schedule, completing the set.
 - Chunk pipelining *across* ring steps (independent chunks flowing through
   the ring simultaneously, rather than slicing within one step), which is how
   gloo takes the 64 MiB 4-rank case.
-- The general non-power-of-two halving-doubling with the remainder fold-in.
 - CUDA-aware path: device buffers staged through pinned host memory with a
-  copy/communication pipeline, where slice pipelining should finally pay.
-- FSDP-style parameter sharding on top of the existing reduce-scatter and
-  all-gather.
+  copy/communication pipeline, which is where all three of the optimizations
+  that lost on loopback should finally pay.
+- Error feedback for low-precision reduction, carrying the per-hop rounding
+  residual forward so ring's accuracy stops degrading with world size.
+- The general non-power-of-two halving-doubling with the remainder fold-in.
 
 ## Layout
 
 ```
 mini_nccl/
-  transport.py       # sockets, mesh rendezvous, channels, timeouts
-  process_group.py   # send / recv / full-duplex and sliced send_recv
-  collectives.py     # ring, tree, halving-doubling, naive; auto selection
-  ddp.py             # buckets, gradient views, overlap reducer, no_sync
-  recorder.py        # flight recorder
-  diagnose.py        # desync analysis and Perfetto trace merging
-  launcher.py        # local multi-process runner
-tests/               # collectives, DDP parity, transport, fault injection
-benchmarks/          # sweep, tuning ablation, cost model fit, charts
-examples/            # char-GPT, desync demo, multi-node benchmark
-docs/multinode.md    # running on real hardware
+  transport.py        # sockets, mesh rendezvous, channels, timeouts
+  process_group.py    # send / recv / full-duplex and sliced send_recv
+  collectives.py      # ring, tree, halving-doubling, naive; narrow-wire option
+  ddp.py              # buckets, gradient views, overlap reducer, no_sync
+  fsdp.py             # parameter sharding, per-unit gather, sharded optimizer
+  tensor_parallel.py  # column/row parallel layers, head-split attention
+  recorder.py         # flight recorder
+  diagnose.py         # desync analysis and Perfetto trace merging
+  launcher.py         # local multi-process runner
+tests/                # collectives, DDP/FSDP/TP parity, faults, precision
+benchmarks/           # sweep, tuning ablation, cost model, precision study
+examples/             # char-GPT (DDP and FSDP), tensor-parallel GPT, demos
+docs/multinode.md     # running on real hardware
 ```
 
 ## License
