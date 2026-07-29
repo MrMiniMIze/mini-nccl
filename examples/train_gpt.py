@@ -20,7 +20,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from model import GPT
+from model import GPT, Block
 
 import mini_nccl as mn
 from mini_nccl import collectives
@@ -49,20 +49,26 @@ def worker(pg, data: torch.Tensor, vocab: str, cfg: dict) -> float:
         n_head=cfg["n_head"],
         n_embd=cfg["n_embd"],
     )
-    ddp = mn.DistributedDataParallel(
-        model,
-        pg,
-        bucket_cap_mb=cfg["bucket_mb"],
-        overlap=not cfg["no_overlap"],
-        algorithm=cfg["algorithm"],
-    )
+    n_params = sum(p.numel() for p in model.parameters())
+    if cfg["fsdp"]:
+        # Shard the transformer blocks; embeddings, norms, and the tied head
+        # stay replicated, which is what a real wrap policy does.
+        wrapped = mn.FullyShardedDataParallel(model, pg, unit_cls=Block)
+    else:
+        wrapped = mn.DistributedDataParallel(
+            model,
+            pg,
+            bucket_cap_mb=cfg["bucket_mb"],
+            overlap=not cfg["no_overlap"],
+            algorithm=cfg["algorithm"],
+        )
     opt = torch.optim.AdamW(
-        model.parameters(), lr=cfg["lr"], betas=(0.9, 0.95), weight_decay=0.1
+        wrapped.parameters(), lr=cfg["lr"], betas=(0.9, 0.95), weight_decay=0.1
     )
 
-    n_params = sum(p.numel() for p in model.parameters())
     if pg.rank == 0:
-        print(f"model: {n_params / 1e6:.2f}M params | world_size={pg.world_size} "
+        mode = "FSDP" if cfg["fsdp"] else "DDP"
+        print(f"model: {n_params / 1e6:.2f}M params | {mode} | world_size={pg.world_size} "
               f"| per-rank batch={cfg['batch_size']} | overlap={not cfg['no_overlap']}")
 
     block, batch = cfg["block_size"], cfg["batch_size"]
@@ -77,10 +83,10 @@ def worker(pg, data: torch.Tensor, vocab: str, cfg: dict) -> float:
         x = torch.stack([data[i : i + block] for i in ix])
         y = torch.stack([data[i + 1 : i + block + 1] for i in ix])
 
-        ddp.zero_grad()
-        _, loss = ddp(x, y)
+        wrapped.zero_grad()
+        _, loss = wrapped(x, y)
         loss.backward()
-        ddp.sync()
+        wrapped.sync()
         opt.step()
 
         window_tokens += batch * block * pg.world_size
@@ -97,9 +103,24 @@ def worker(pg, data: torch.Tensor, vocab: str, cfg: dict) -> float:
                 window_start = time.perf_counter()
                 window_tokens = 0
 
+    if cfg["fsdp"] and pg.rank == 0:
+        report = wrapped.memory_report()
+        mib = {key: value / 2**20 for key, value in report.items()}
+        print(
+            "\nparameter memory per rank:\n"
+            f"  DDP equivalent (full replica): {mib['ddp_equivalent']:6.2f} MiB\n"
+            f"  FSDP resident shards:          {mib['sharded_params_resident']:6.2f} MiB\n"
+            f"  FSDP replicated (embeds/head): {mib['replicated_params']:6.2f} MiB\n"
+            f"  FSDP peak transient gather:    {mib['peak_transient']:6.2f} MiB\n"
+            f"  FSDP peak total:               {mib['fsdp_peak']:6.2f} MiB"
+        )
+
     if pg.rank == 0 and cfg["sample"]:
         stoi = {ch: i for i, ch in enumerate(vocab)}
         prompt = torch.tensor([[stoi["\n"]]], dtype=torch.long)
+        # Sampling needs the real weights, which under FSDP live in shards.
+        if cfg["fsdp"]:
+            model.load_state_dict(wrapped.full_state_dict())
         out = model.generate(prompt, max_new_tokens=300)
         text = "".join(vocab[i] for i in out[0].tolist())
         print("\n--- sample ---" + text + "\n--------------")
@@ -118,6 +139,11 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--bucket-mb", type=float, default=0.5)
     ap.add_argument("--no-overlap", action="store_true")
+    ap.add_argument(
+        "--fsdp",
+        action="store_true",
+        help="shard the transformer blocks across ranks instead of replicating them",
+    )
     ap.add_argument(
         "--algorithm", choices=["ring", "tree", "halving", "naive", "auto"], default="ring"
     )

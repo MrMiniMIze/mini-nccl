@@ -34,6 +34,7 @@ from .errors import (
     PeerClosedError,
     RendezvousError,
 )
+from .fsdp import FullyShardedDataParallel
 from .launcher import run
 from .process_group import DEFAULT_N_CHANNELS, ProcessGroup
 from .recorder import Recorder
@@ -43,6 +44,7 @@ __all__ = [
     "DEFAULT_N_CHANNELS",
     "CollectiveTimeoutError",
     "DistributedDataParallel",
+    "FullyShardedDataParallel",
     "MiniNcclError",
     "PeerClosedError",
     "ProcessGroup",
