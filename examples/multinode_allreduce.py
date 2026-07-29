@@ -60,12 +60,12 @@ def main() -> None:
                 seconds = (time.perf_counter() - start) / args.iters
                 # NCCL-convention bus bandwidth for all-reduce.
                 busbw = nbytes / seconds / 1e9 * 2 * (world - 1) / world
-                cells.append(f"{seconds * 1e3:7.2f}ms {busbw:4.2f}")
+                cells.append(f"{seconds * 1e3:7.2f}ms {busbw:5.3f}")
             if rank == 0:
                 label = (
-                    f"{nbytes / 2**20:.3f}MiB" if nbytes >= 2**20 else f"{nbytes // 1024}KiB"
+                    f"{nbytes / 2**20:g} MiB" if nbytes >= 2**20 else f"{nbytes / 1024:g} KiB"
                 )
-                print(f"{label:>10} " + " ".join(f"{cell:>12}" for cell in cells), flush=True)
+                print(f"{label:>10} " + " ".join(f"{cell:>13}" for cell in cells), flush=True)
         c.barrier(pg)
         if rank == 0:
             print("\ncolumns are: time per all-reduce, then bus bandwidth in GB/s")
