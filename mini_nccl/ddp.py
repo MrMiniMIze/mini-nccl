@@ -56,7 +56,7 @@ class _Bucket:
         self.buffer = torch.zeros(sum(numels), dtype=dtype)
         self.views: list[torch.Tensor] = []
         offset = 0
-        for p, n in zip(params, numels):
+        for p, n in zip(params, numels, strict=True):
             self.views.append(self.buffer[offset : offset + n].view(p.shape))
             offset += n
         self.ready_count = 0
@@ -65,7 +65,7 @@ class _Bucket:
 
     def attach_grads(self) -> None:
         """Point every param.grad at its slice of the flat buffer."""
-        for p, view in zip(self.params, self.views):
+        for p, view in zip(self.params, self.views, strict=True):
             p.grad = view
 
     def mark_ready(self) -> None:
@@ -194,7 +194,7 @@ class DistributedDataParallel(nn.Module):
         for bucket in self._buckets:
             bucket.reset()
 
-    def zero_grad(self, set_to_none: bool = False) -> None:  # noqa: ARG002
+    def zero_grad(self, set_to_none: bool = False) -> None:
         """Zero gradients in place.
 
         ``set_to_none`` is ignored: grads must stay views into the bucket

@@ -24,6 +24,7 @@ Design notes:
 
 from __future__ import annotations
 
+import contextlib
 import socket
 import struct
 import threading
@@ -81,10 +82,8 @@ class Connection:
             remaining -= n
 
     def close(self) -> None:
-        try:
+        with contextlib.suppress(OSError):  # already closed by the peer
             self._sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
         self._sock.close()
 
 

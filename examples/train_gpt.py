@@ -20,9 +20,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from model import GPT
+
 import mini_nccl as mn
 from mini_nccl import collectives
-from model import GPT
 
 DATA_URL = (
     "https://raw.githubusercontent.com/karpathy/char-rnn/master/"
@@ -55,7 +56,9 @@ def worker(pg, data: torch.Tensor, vocab: str, cfg: dict) -> float:
         overlap=not cfg["no_overlap"],
         algorithm=cfg["algorithm"],
     )
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], betas=(0.9, 0.95), weight_decay=0.1)
+    opt = torch.optim.AdamW(
+        model.parameters(), lr=cfg["lr"], betas=(0.9, 0.95), weight_decay=0.1
+    )
 
     n_params = sum(p.numel() for p in model.parameters())
     if pg.rank == 0:
@@ -115,8 +118,14 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--bucket-mb", type=float, default=0.5)
     ap.add_argument("--no-overlap", action="store_true")
-    ap.add_argument("--algorithm", choices=["ring", "tree", "naive", "auto"], default="ring")
+    ap.add_argument(
+        "--algorithm", choices=["ring", "tree", "halving", "naive", "auto"], default="ring"
+    )
     ap.add_argument("--sample", action="store_true", help="print generated text at the end")
+    ap.add_argument(
+        "--trace-dir",
+        help="record every collective here, then view with python -m mini_nccl.diagnose",
+    )
     args = ap.parse_args()
 
     text = load_corpus()
@@ -127,8 +136,17 @@ def main() -> None:
 
     cfg = vars(args).copy()
     world_size = cfg.pop("world_size")
-    losses = mn.run(worker, world_size, data, vocab, cfg, timeout=3600.0)
+    trace_dir = cfg.pop("trace_dir")
+    losses = mn.run(
+        worker, world_size, data, vocab, cfg, timeout=3600.0, trace_dir=trace_dir
+    )
     print(f"final loss: {losses[0]:.4f}")
+    if trace_dir:
+        print(
+            f"\ntrace written to {trace_dir}\n"
+            f"  python -m mini_nccl.diagnose {trace_dir} --trace {trace_dir}/merged.json\n"
+            f"  then open merged.json in https://ui.perfetto.dev"
+        )
 
 
 if __name__ == "__main__":

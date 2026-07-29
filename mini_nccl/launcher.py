@@ -14,6 +14,7 @@ those logs matter. See ``python -m mini_nccl.diagnose``.
 
 from __future__ import annotations
 
+import contextlib
 import multiprocessing as mp
 import socket
 import time
@@ -58,12 +59,14 @@ def _worker(fn, rank, world_size, addrs, args, result_q, options) -> None:
         result_q.put((rank, "ok", result))
     except BaseException:
         if pg is not None and trace_dir:
-            try:
+            # Best effort: the recorder dump is diagnostic, so a failure here
+            # must not replace the original exception.
+            with contextlib.suppress(OSError):
                 pg.recorder.dump(trace_dir)
-            except OSError:
-                pass
         result_q.put((rank, "err", traceback.format_exc()))
-        raise SystemExit(1)
+        # The traceback is already on the queue for the parent to re-raise;
+        # exit quietly rather than chaining onto stderr from every rank.
+        raise SystemExit(1) from None
 
 
 def run(

@@ -18,7 +18,6 @@ Two primitives do the real work:
 
 from __future__ import annotations
 
-import socket
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
@@ -84,13 +83,13 @@ class ProcessGroup:
     def send(self, tensor: torch.Tensor, dst: int, channel: int = 0) -> None:
         try:
             self._mesh.conns[dst][channel].send(byte_view(tensor))
-        except socket.timeout as exc:
+        except TimeoutError as exc:
             raise self._timeout_error("send", dst, channel) from exc
 
     def recv(self, tensor: torch.Tensor, src: int, channel: int = 0) -> None:
         try:
             self._mesh.conns[src][channel].recv_into(byte_view(tensor))
-        except socket.timeout as exc:
+        except TimeoutError as exc:
             raise self._timeout_error("recv", src, channel) from exc
 
     def send_recv(
@@ -162,7 +161,7 @@ class ProcessGroup:
         for fut in futures:
             try:
                 fut.result()
-            except BaseException as exc:  # noqa: BLE001 - report every channel's failure
+            except BaseException as exc:
                 errors.append(exc)
         if errors:
             raise errors[0]
@@ -190,7 +189,7 @@ class ProcessGroup:
         self._channel_pool.shutdown(wait=True)
         self._mesh.close()
 
-    def __enter__(self) -> "ProcessGroup":
+    def __enter__(self) -> ProcessGroup:
         return self
 
     def __exit__(self, *exc) -> None:
