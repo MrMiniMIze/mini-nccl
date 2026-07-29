@@ -31,6 +31,7 @@ loopback hides](#what-loopback-teaches-and-what-it-hides).
 | Layer | File | What it does |
 |---|---|---|
 | Transport | `mini_nccl/transport.py` | Full-mesh TCP rendezvous, N connections per peer ("channels"), zero-copy receives straight into tensor storage, bounded operation timeouts |
+| Device path | `mini_nccl/device.py` | Pinned host staging, CUDA streams and events, chunked copy/network pipeline for accelerator tensors |
 | Process group | `mini_nccl/process_group.py` | `send` / `recv` / full-duplex `send_recv` / sliced `send_recv`: the primitives everything else is built from |
 | Collectives | `mini_nccl/collectives.py` | `all_reduce` (ring, tree, halving-doubling, naive), `reduce_scatter`, `all_gather`, `broadcast`, `all_to_all`, `barrier`, optional narrow wire dtype |
 | DDP | `mini_nccl/ddp.py` | Gradient bucketing, grads-as-bucket-views, overlap on a reducer thread, `no_sync()` accumulation |
@@ -47,7 +48,7 @@ loopback hides](#what-loopback-teaches-and-what-it-hides).
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 37 tests, world sizes 2-8
+pytest -q                                        # 47 tests, world sizes 2-8
 
 python examples/train_gpt.py --world-size 4 --steps 200 --sample
 python examples/train_gpt.py --world-size 4 --steps 200 --fsdp   # sharded
@@ -57,6 +58,7 @@ python benchmarks/bench_allreduce.py --world-sizes 2,4 --gloo
 python benchmarks/bench_ablation.py              # channel + pipeline tuning
 python benchmarks/fit_cost_model.py              # alpha-beta fit
 python benchmarks/bench_low_precision.py         # bfloat16 wire study
+python benchmarks/bench_device.py                # device staging vs pipelining
 ```
 
 The API mirrors `torch.distributed`:
@@ -381,6 +383,31 @@ in the code but defaulting them off is the honest response: the code is ready
 for the hardware it was designed for, and the defaults suit the hardware it
 actually runs on.
 
+### Device tensors: pinned staging and a copy/network pipeline
+
+A socket can only send host memory, so a tensor on an accelerator has to be
+staged through the host and back. `mini_nccl/device.py` does that three ways so
+they can be compared: naively (`tensor.cpu()`, reduce, copy back), through
+explicitly **pinned** host buffers so the copy engine can DMA directly, and as
+a ring on the device tensor with the payload **chunked** so chunk `k` is on the
+wire while chunk `k+1` is still being copied off the device.
+
+That third one is the case the pipelining idea was always meant for. It lost
+5-40% on CPU tensors because loopback's "network" is a memcpy on the same cores
+that would do the copying. A device copy engine is separate silicon from the
+CPU writing to the socket, so the two can genuinely overlap.
+
+**What is verified, stated precisely.** The chunking and double-buffering logic
+is shared between the CPU and CUDA paths and is tested on CPU in CI: exact
+payload coverage, agreement with the plain ring at chunk sizes from 64 bytes to
+1 MiB, payloads smaller than one chunk, non-contiguous rejection. A separate
+test checks that every CUDA API the code calls exists in the installed torch.
+**Execution on an actual GPU is not verified**: the development machine's
+driver is from 2020 (CUDA 11.0 maximum) and every PyTorch CUDA build for
+Python 3.14 needs CUDA 12.6+. Two tests cover the device path and currently
+skip; `docs/cuda.md` has the two commands that light them up, and the CPU null
+result to compare against.
+
 ### Low precision: the error is in the hops, not the accumulator
 
 Sending gradients as bfloat16 is standard practice for large models, and
@@ -527,9 +554,9 @@ to a win.
 
 ## Limitations (deliberate)
 
-- **CPU tensors, TCP transport.** The algorithms are transport-agnostic; the
-  socket layer is the reference implementation. Device buffers would stage
-  through pinned host memory.
+- **The device path is unmeasured.** Pinned staging and the copy/network
+  pipeline are implemented and their logic is tested on CPU, but no GPU has run
+  them (see `docs/cuda.md`). Treat that code as reviewed, not benchmarked.
 - **A process group is not thread-safe per channel.** Collectives must be
   issued in identical order on every rank, so callers serialize per channel.
   This is NCCL's contract too, and the DDP reducer is built around it.
@@ -550,9 +577,9 @@ to a win.
 - Chunk pipelining *across* ring steps (independent chunks flowing through
   the ring simultaneously, rather than slicing within one step), which is how
   gloo takes the 64 MiB 4-rank case.
-- CUDA-aware path: device buffers staged through pinned host memory with a
-  copy/communication pipeline, which is where all three of the optimizations
-  that lost on loopback should finally pay.
+- Measure the device path on real GPUs, one per rank, against NCCL itself
+  through `torch.distributed`. That is where the three optimizations that lost
+  on loopback should finally pay.
 - Error feedback for low-precision reduction, carrying the per-hop rounding
   residual forward so ring's accuracy stops degrading with world size.
 - The general non-power-of-two halving-doubling with the remainder fold-in.
@@ -567,6 +594,7 @@ mini_nccl/
   ddp.py              # buckets, gradient views, overlap reducer, no_sync
   fsdp.py             # parameter sharding, per-unit gather, sharded optimizer
   tensor_parallel.py  # column/row parallel layers, head-split attention
+  device.py           # pinned staging, copy/network pipeline for GPU tensors
   recorder.py         # flight recorder
   diagnose.py         # desync analysis and Perfetto trace merging
   launcher.py         # local multi-process runner
@@ -574,6 +602,7 @@ tests/                # collectives, DDP/FSDP/TP parity, faults, precision
 benchmarks/           # sweep, tuning ablation, cost model, precision study
 examples/             # char-GPT (DDP and FSDP), tensor-parallel GPT, demos
 docs/multinode.md     # running on real hardware
+docs/cuda.md          # the device path, and how to enable it
 ```
 
 ## License
