@@ -36,7 +36,7 @@ measured well enough to trust, including where it loses.
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 18 tests, world sizes 2-4
+pytest -q                                        # 22 tests, world sizes 2-4
 
 python examples/train_gpt.py --world-size 4 --steps 200 --sample
 python examples/desync_demo.py                   # a hang, diagnosed
@@ -291,6 +291,12 @@ DESYNC at collective #2: ranks issued *different* collectives.
   return, an unequal batch count).
 ```
 
+The event log is a ring buffer (32768 events by default), because a training
+job issues collectives forever and an unbounded log would leak memory in
+exactly the long runs worth recording. The analysis is keyed by sequence
+number rather than log position, so it still finds the divergence when ranks
+have discarded different amounts of history.
+
 `--trace merged.json` merges every rank's events into Trace Event Format for
 Perfetto or `chrome://tracing`, one process per rank and one track per
 channel, which is how you *see* DDP buckets reducing while backward is still
@@ -325,7 +331,7 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q     # 18 tests, ~80 s (process spawn dominates)
+pytest -q     # 22 tests, ~95 s (process spawn dominates)
 ```
 
 - **Collectives:** every collective x every algorithm x sum/max/min/prod x
@@ -337,9 +343,13 @@ pytest -q     # 18 tests, ~80 s (process spawn dominates)
   multi-bucket, `no_sync()` accumulation), and initial-weight broadcast.
 - **Transport:** full-duplex ring rotation deadlock test, zero-copy
   invariants.
-- **Faults:** a rank dying mid-collective must surface in seconds, and a
-  desync must produce a timeout plus a diagnosis naming the divergent
-  collective.
+- **Faults:** a rank dying mid-collective must surface in seconds; a desync
+  must produce a timeout plus a diagnosis naming the divergent collective,
+  including when the recorder's ring buffer has already discarded the start
+  of the run.
+- **Bootstrap:** two independently launched processes must find each other
+  from environment variables alone, with no launcher wiring them together.
+  That is the path a real cluster uses.
 
 ## Running across machines
 
