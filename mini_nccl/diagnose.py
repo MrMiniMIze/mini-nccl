@@ -37,47 +37,52 @@ def load(directory: Path) -> list[dict]:
     return sorted(states, key=lambda s: s["rank"])
 
 
-def _order_streams(states: list[dict]) -> dict[int, list[dict]]:
-    """Per-rank list of top-level collectives, in issue order."""
-    streams = {}
-    for s in states:
-        events = [ev for ev in s["events"] if ev["channel"] == -1]
-        streams[s["rank"]] = sorted(events, key=lambda ev: ev["seq"])
-    return streams
+def _order_streams(states: list[dict]) -> dict[int, dict[int, dict]]:
+    """Per-rank map of sequence number to top-level collective.
+
+    Keyed by sequence number rather than position, because the event log is
+    a ring buffer: two ranks may have dropped different amounts, and only the
+    sequence number identifies the same slot in the collective stream on
+    every rank.
+    """
+    return {
+        s["rank"]: {ev["seq"]: ev for ev in s["events"] if ev["channel"] == -1}
+        for s in states
+    }
 
 
-def _find_divergence(streams: dict[int, list[dict]]) -> int:
+def _find_divergence(streams: dict[int, dict[int, dict]]) -> int:
     """Report the first collective where ranks disagree. Returns findings count."""
     if len(streams) < 2:
         return 0
-    longest = max(len(s) for s in streams.values())
-    for i in range(longest):
-        signatures = {}
-        for rank, stream in streams.items():
-            signatures[rank] = (
-                (stream[i]["op"], stream[i]["nbytes"]) if i < len(stream) else None
-            )
-        distinct = {sig for sig in signatures.values() if sig is not None}
-        if len(distinct) <= 1 and None not in signatures.values():
+
+    for seq in sorted(set().union(*(set(d) for d in streams.values()))):
+        present = {rank: d[seq] for rank, d in streams.items() if seq in d}
+        if len(present) < 2:
+            continue  # only one rank retained this slot; nothing to compare
+        signatures = {r: (ev["op"], ev["nbytes"]) for r, ev in present.items()}
+        if len(set(signatures.values())) <= 1:
             continue
-        if len(distinct) <= 1 and None in signatures.values():
-            missing = sorted(r for r, sig in signatures.items() if sig is None)
-            print(
-                f"\nDESYNC at collective #{i}: ranks {missing} never issued it, "
-                f"while the others did.\n"
-                f"  Ranks must issue identical collective sequences. The ranks "
-                f"listed above stopped early; the rest are blocked waiting on them."
-            )
-            return 1
-        print(f"\nDESYNC at collective #{i}: ranks issued *different* collectives.")
+        print(f"\nDESYNC at collective #{seq}: ranks issued *different* collectives.")
         for rank in sorted(signatures):
-            sig = signatures[rank]
-            what = f"{sig[0]} ({sig[1]} bytes)" if sig else "nothing (stopped earlier)"
-            print(f"    rank {rank}: {what}")
+            op, nbytes = signatures[rank]
+            print(f"    rank {rank}: {op} ({nbytes} bytes)")
         print(
             "  Ranks must issue identical collective sequences. Look at what the "
             "odd rank out did differently just before this point (a conditional "
             "branch, an early return, an unequal batch count)."
+        )
+        return 1
+
+    # No mismatch in the overlap, so look for ranks that simply stopped early.
+    reached = {rank: (max(d) if d else -1) for rank, d in streams.items()}
+    if len(set(reached.values())) > 1:
+        furthest = max(reached.values())
+        behind = sorted(r for r, n in reached.items() if n < furthest)
+        print(
+            f"\nDESYNC: ranks {behind} stopped early, reaching collective "
+            f"#{[reached[r] for r in behind]} while others reached #{furthest}.\n"
+            f"  The lagging ranks are the cause; the rest are blocked waiting on them."
         )
         return 1
     return 0
@@ -98,7 +103,10 @@ def report(states: list[dict]) -> int:
         counts = {
             CHANNEL_LABEL.get(int(c), f"ch{c}"): n for c, n in sorted(s["next_seq"].items())
         }
-        print(f"  rank {s['rank']}: {counts}")
+        note = ""
+        if s.get("dropped"):
+            note = f"  [ring buffer dropped {s['dropped']} older events]"
+        print(f"  rank {s['rank']}: {counts}{note}")
 
     streams = _order_streams(states)
     findings += _find_divergence(streams)

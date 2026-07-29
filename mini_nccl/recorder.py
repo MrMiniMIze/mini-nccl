@@ -15,7 +15,14 @@ Two things fall out of that:
 
 Recording is off unless asked for, either with ``ProcessGroup(trace=True)``
 or by setting ``MINI_NCCL_TRACE=1``. When enabled, the per-collective cost
-is one timestamp pair and a list append.
+is one timestamp pair and a deque append.
+
+The event log is a **ring buffer** (``MINI_NCCL_TRACE_CAPACITY``, default
+32768 events). A training job issues collectives forever, so an unbounded
+log would be a slow memory leak in exactly the long runs worth recording.
+Keeping the most recent window is also what the diagnosis needs: sequence
+counters stay monotonic, so a rank that fell behind is still identifiable
+from the tail.
 """
 
 from __future__ import annotations
@@ -24,8 +31,11 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+
+DEFAULT_CAPACITY = int(os.environ.get("MINI_NCCL_TRACE_CAPACITY", "32768"))
 
 
 @dataclass
@@ -64,11 +74,19 @@ class Recorder:
     concurrent, two on the same channel are not.
     """
 
-    def __init__(self, rank: int, world_size: int, enabled: bool = False) -> None:
+    def __init__(
+        self,
+        rank: int,
+        world_size: int,
+        enabled: bool = False,
+        capacity: int = DEFAULT_CAPACITY,
+    ) -> None:
         self.rank = rank
         self.world_size = world_size
         self.enabled = enabled
-        self._events: list[Event] = []
+        self.capacity = capacity
+        self._events: deque[Event] = deque(maxlen=capacity)
+        self._dropped = 0
         self._seq: dict[int, int] = {}
         self._lock = threading.Lock()
         self._t0_ns = time.perf_counter_ns()
@@ -106,6 +124,8 @@ class Recorder:
             detail=detail,
         )
         with self._lock:
+            if len(self._events) == self._events.maxlen:
+                self._dropped += 1
             self._events.append(ev)
         return ev
 
@@ -149,6 +169,8 @@ class Recorder:
             "rank": self.rank,
             "world_size": self.world_size,
             "wall_start": self._t0_wall,
+            "capacity": self.capacity,
+            "dropped": self._dropped,
             "next_seq": self._seq,
             "pending": [self._event_dict(ev) for ev in self.pending()],
             "events": [self._event_dict(ev) for ev in self._events],

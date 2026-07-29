@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import deque
 
 import pytest
 import torch
@@ -86,6 +87,52 @@ def test_desync_times_out_with_diagnosis(tmp_path) -> None:
     assert "DESYNC at collective #1" in proc.stdout, proc.stdout
     assert "rank 1: barrier" in proc.stdout, proc.stdout
     assert (tmp_path / "merged.json").exists()
+
+
+def _ring_buffer_worker(pg) -> None:
+    """A long run must not grow the recorder without bound."""
+    pg.recorder.enabled = True
+    pg.recorder.capacity = 8
+    pg.recorder._events = deque(pg.recorder._events, maxlen=8)
+    for _ in range(40):
+        c.all_reduce(pg, torch.ones(64))
+    assert len(pg.recorder._events) == 8, len(pg.recorder._events)
+    assert pg.recorder._dropped > 0
+    # Sequence numbers keep counting past the window, which is what lets a
+    # truncated log still be compared across ranks.
+    assert pg.recorder.next_seq(-1) >= 40
+
+
+def test_recorder_ring_buffer_bounds_memory() -> None:
+    run(_ring_buffer_worker, 2, trace_dir=None, op_timeout=30.0)
+
+
+def _truncated_desync_worker(pg) -> None:
+    """Desync after the window has already rolled over."""
+    pg.recorder.capacity = 6
+    pg.recorder._events = deque(pg.recorder._events, maxlen=6)
+    tensor = torch.ones(128)
+    for _ in range(20):
+        c.all_reduce(pg, tensor)
+    if pg.rank != 1:
+        c.all_reduce(pg, tensor)  # rank 1 skips this one
+    c.barrier(pg)
+
+
+def test_desync_found_even_when_log_truncated(tmp_path) -> None:
+    trace_dir = tmp_path / "trace"
+    with pytest.raises(RuntimeError):
+        run(_truncated_desync_worker, 3, timeout=90.0, op_timeout=3.0, trace_dir=trace_dir)
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "mini_nccl.diagnose", str(trace_dir)],
+        capture_output=True, text=True,
+    )
+    assert "dropped" in proc.stdout, proc.stdout
+    # Aligning by sequence number (not list position) is what makes this work
+    # when ranks have dropped different numbers of older events.
+    assert "DESYNC at collective #20" in proc.stdout, proc.stdout
+    assert "rank 1: barrier" in proc.stdout, proc.stdout
 
 
 def _healthy_traced_worker(pg) -> None:
