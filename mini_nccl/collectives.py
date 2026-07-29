@@ -40,9 +40,10 @@ import torch
 from .process_group import ProcessGroup
 
 # Crossover point between latency-bound and bandwidth-bound messages.
-# Tune this from benchmarks/bench_allreduce.py results on your own fabric;
-# on loopback TCP it sits around a few hundred KiB.
-RING_THRESHOLD_BYTES = 256 * 1024
+# Measured on loopback TCP: at 1 MiB tree and ring tie at both world sizes
+# tested, and ring pulls clearly ahead by 4 MiB. Re-derive it for your own
+# fabric from benchmarks/bench_allreduce.py.
+RING_THRESHOLD_BYTES = 1024 * 1024
 
 # Splitting across channels only pays once each channel has a real payload.
 # 8 MiB is where a second channel started winning on loopback TCP (below it,

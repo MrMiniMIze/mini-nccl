@@ -21,8 +21,9 @@ OUT_DIR = Path(__file__).parent.parent / "docs" / "img"
 SERIES = {
     "ring": {"color": "#2a78d6", "marker": "o", "label": "mini-nccl ring"},
     "tree": {"color": "#eb6834", "marker": "s", "label": "mini-nccl tree"},
-    "naive": {"color": "#1baf7a", "marker": "^", "label": "mini-nccl naive"},
-    "gloo": {"color": "#eda100", "marker": "D", "label": "torch.distributed gloo"},
+    "halving": {"color": "#1baf7a", "marker": "^", "label": "mini-nccl halving-doubling"},
+    "naive": {"color": "#eda100", "marker": "D", "label": "mini-nccl naive"},
+    "gloo": {"color": "#e87ba4", "marker": "v", "label": "torch.distributed gloo"},
 }
 
 SURFACE = "#fcfcfb"
@@ -73,7 +74,7 @@ def plot_busbw(data) -> None:
     fig, axes = plt.subplots(
         1, len(worlds), figsize=(5.4 * len(worlds), 4.2), facecolor=SURFACE, sharey=True
     )
-    for ax, world in zip(axes, worlds):
+    for ax, world in zip(axes, worlds, strict=True):
         for name, spec in SERIES.items():
             if name not in data[world]:
                 continue

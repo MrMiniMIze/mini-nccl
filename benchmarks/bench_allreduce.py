@@ -46,10 +46,11 @@ def _bench_worker(pg, numels, iters, warmup, gloo_port) -> list[tuple[str, int, 
     for numel in numels:
         tensor = torch.randn(numel)
         contenders: list[tuple[str, object]] = [
-            (algo, lambda a=algo: c.all_reduce(pg, tensor, algorithm=a)) for algo in ALGORITHMS
+            (algo, lambda a=algo, t=tensor: c.all_reduce(pg, t, algorithm=a))
+            for algo in ALGORITHMS
         ]
         if gloo is not None:
-            contenders.append(("gloo", lambda: gloo.all_reduce(tensor)))
+            contenders.append(("gloo", lambda t=tensor: gloo.all_reduce(t)))
 
         for name, fn in contenders:
             for _ in range(warmup):

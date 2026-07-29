@@ -18,8 +18,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples"))
 
-import mini_nccl as mn
 from model import GPT
+
+import mini_nccl as mn
 
 
 def _time_config(pg, overlap: bool, steps: int, cfg: dict) -> float:
