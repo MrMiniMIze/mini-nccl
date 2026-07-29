@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-nccl"
+version = "0.1.0"
+description = "A from-scratch collective communications library (ring/tree all-reduce, reduce-scatter, all-gather) with a bucketed-overlap DDP built on top of it"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "MrMiniMIze" }]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "numpy",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+include = ["mini_nccl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
