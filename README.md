@@ -766,10 +766,14 @@ pytest -q     # 67 tests, ~7 min (process spawn dominates)
   inside pipeline inside data, on 8 ranks) must both match single-process
   training gradient by gradient; collectives must work unchanged on a subgroup;
   and the partitions must be provably orthogonal.
-- **Timing claims:** the flight recorder's own timestamps must show a DDP bucket
-  reduction beginning *before* backward returns, and must not when overlap is
-  disabled. A "+2%" throughput result cannot distinguish a working mechanism
-  from a broken one, so the mechanism is asserted separately.
+- **Timing claims:** DDP must *dispatch* a bucket reduction before backward
+  returns, and must not when overlap is disabled. A "+2%" throughput result
+  cannot distinguish a working mechanism from a broken one, so the mechanism is
+  asserted separately. Deliberately only the dispatch: whether the comm thread
+  then gets CPU time before backward ends is the OS's call, and this test caught
+  itself asserting otherwise when CI's two-core runner scheduled the reduction
+  41us *after* a 5203us backward. Execution overlap is measured and printed
+  instead, which is the same fact the "+2%" reports.
 - **Low precision:** ring's error grows with world size while tree's does not,
   and a narrow wire still moves the right bits.
 - **Device path:** chunking covers the payload exactly and the pipelined ring

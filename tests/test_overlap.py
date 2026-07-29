@@ -1,16 +1,25 @@
 """Proving the claims the README makes about timing.
 
-Two claims elsewhere in this project rest on wall-clock behaviour rather than
-arithmetic, so they are asserted here from the flight recorder's own timestamps
-instead of being taken on trust:
+Two claims elsewhere in this project rest on runtime behaviour rather than
+arithmetic, so they are checked here instead of being taken on trust:
 
-1. DDP really does start reducing a bucket while backward is still running. The
-   "+2% from overlap" measurement says the payoff is small on this hardware; it
-   does not say whether the mechanism works at all, and those are different
-   questions. If a refactor accidentally serialized the reducer, the throughput
-   change would be within noise while the design claim quietly became false.
+1. DDP really does dispatch a bucket's reduction while backward is still
+   running. The "+2% from overlap" measurement says the payoff is small on this
+   hardware; it does not say whether the mechanism works, and those are
+   different questions. If a refactor serialized the reducer, the throughput
+   change would sit inside the noise while the design claim quietly became
+   false.
 2. A consistently slow rank is identifiable from a trace, which is what makes a
    straggler diagnosable rather than merely suspected.
+
+**What is asserted, and what is only measured.** The *dispatch* is
+deterministic: the post-accumulate-grad hook fires partway through backward, so
+the reduction is handed to the comm thread before backward returns. Whether that
+thread then gets CPU time before backward finishes is up to the OS, and on a
+saturated two-core CI runner it may not: this test originally asserted execution
+overlap and failed on CI with the first reduction starting 41us *after* a 5203us
+backward. That is not a bug, it is the same fact the "+2%" number reports, so
+execution overlap is measured and reported while only the dispatch is asserted.
 """
 
 from __future__ import annotations
@@ -53,12 +62,13 @@ def _overlap_worker(pg, overlap: bool) -> dict:
         F.mse_loss(ddp(x), y).backward()
         ddp.sync()
 
-    first_start = None
     ddp.zero_grad()
     loss = F.mse_loss(ddp(x), y)
     backward_begin = time.perf_counter_ns()
     loss.backward()
     backward_end = time.perf_counter_ns()
+    # Captured before sync() clears it for the next iteration.
+    submitted = ddp.reduce_submitted_ns
     ddp.sync()
 
     # The recorder stamps events with time.perf_counter_ns(), the same clock.
@@ -67,13 +77,15 @@ def _overlap_worker(pg, overlap: bool) -> dict:
         for ev in pg.recorder._events
         if ev.op.startswith("ddp_bucket") and ev.start_ns >= backward_begin
     ]
-    if bucket_events:
-        first_start = min(ev.start_ns for ev in bucket_events)
+    first_start = min((ev.start_ns for ev in bucket_events), default=None)
     return {
         "rank": pg.rank,
         "n_buckets": len(ddp._buckets),
         "n_events": len(bucket_events),
-        # Negative means a reduction began before backward returned.
+        # Negative means it happened before backward returned.
+        "dispatch_minus_backward_end_us": (
+            None if submitted is None else (submitted - backward_end) / 1e3
+        ),
         "first_reduce_minus_backward_end_us": (
             None if first_start is None else (first_start - backward_end) / 1e3
         ),
@@ -81,22 +93,36 @@ def _overlap_worker(pg, overlap: bool) -> dict:
     }
 
 
-def test_overlap_starts_reducing_before_backward_finishes() -> None:
+def test_overlap_dispatches_the_reduction_during_backward() -> None:
+    """The deterministic half: the hook hands off work before backward returns."""
     reports = run(_overlap_worker, 2, True)
     for report in reports:
         assert report["n_buckets"] > 1, report
         assert report["n_events"] > 0, report
-        offset = report["first_reduce_minus_backward_end_us"]
-        assert offset is not None and offset < 0, (
-            f"rank {report['rank']}: first bucket reduction began "
-            f"{offset:.0f}us after backward returned, so nothing overlapped: {report}"
+        dispatch = report["dispatch_minus_backward_end_us"]
+        assert dispatch is not None, f"nothing was dispatched at all: {report}"
+        assert dispatch < 0, (
+            f"rank {report['rank']}: the reduction was dispatched "
+            f"{dispatch:.0f}us after backward returned, so the hook is no longer "
+            f"firing mid-backward: {report}"
+        )
+        # Reported, not asserted: whether the comm thread got CPU time before
+        # backward finished. See this module's docstring.
+        print(
+            f"rank {report['rank']}: dispatch {dispatch:.0f}us, first reduction "
+            f"{report['first_reduce_minus_backward_end_us']:.0f}us "
+            f"relative to a {report['backward_us']:.0f}us backward"
         )
 
 
-def test_without_overlap_reduction_waits_for_backward() -> None:
-    """The control: with overlap off, every reduction happens after backward."""
+def test_without_overlap_nothing_is_dispatched_during_backward() -> None:
+    """The control: with overlap off, the reduction only happens in sync()."""
     reports = run(_overlap_worker, 2, False)
     for report in reports:
+        assert report["dispatch_minus_backward_end_us"] is None, (
+            f"rank {report['rank']}: something was dispatched during backward "
+            f"even though overlap is disabled: {report}"
+        )
         offset = report["first_reduce_minus_backward_end_us"]
         assert offset is not None and offset > 0, (
             f"rank {report['rank']}: reduction began before backward returned "

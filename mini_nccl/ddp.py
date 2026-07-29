@@ -39,6 +39,7 @@ Not supported (kept out of scope deliberately): unused-parameter detection.
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 
@@ -126,6 +127,11 @@ class DistributedDataParallel(nn.Module):
         self._reduce_future: Future | None = None
         self._buckets: list[_Bucket] = []
         self._accumulating = False
+        #: ``perf_counter_ns`` when this iteration's reduction was dispatched,
+        #: or None if it has not been. Observable so that "the reduction is
+        #: dispatched during backward" can be checked rather than assumed;
+        #: whether the comm thread then gets CPU time is the OS's business.
+        self.reduce_submitted_ns: int | None = None
 
         # Every rank starts from rank 0's weights.
         if pg.world_size > 1:
@@ -173,6 +179,7 @@ class DistributedDataParallel(nn.Module):
             bucket.mark_ready()
             # The first ready mark of an iteration kicks off the reducer.
             if self._overlap and self._reduce_future is None:
+                self.reduce_submitted_ns = time.perf_counter_ns()
                 self._reduce_future = self._comm.submit(self._reduce_all)
 
         return hook
@@ -222,6 +229,7 @@ class DistributedDataParallel(nn.Module):
             self._reduce_all()
         for bucket in self._buckets:
             bucket.reset()
+        self.reduce_submitted_ns = None
 
     def zero_grad(self, set_to_none: bool = False) -> None:
         """Zero gradients in place.
