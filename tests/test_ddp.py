@@ -60,7 +60,7 @@ def _train_parity(pg, overlap: bool, bucket_cap_mb: float, steps: int = 6) -> No
         F.mse_loss(reference(x), y).backward()
         ref_opt.step()
 
-    for p, ref_p in zip(model.parameters(), reference.parameters()):
+    for p, ref_p in zip(model.parameters(), reference.parameters(), strict=True):
         torch.testing.assert_close(p, ref_p, rtol=1e-4, atol=1e-5)
 
 
@@ -109,7 +109,7 @@ def _no_sync_worker(pg, steps: int = 4) -> None:
         F.mse_loss(reference(x), y).backward()
         ref_opt.step()
 
-    for p, ref_p in zip(model.parameters(), reference.parameters()):
+    for p, ref_p in zip(model.parameters(), reference.parameters(), strict=True):
         torch.testing.assert_close(p, ref_p, rtol=1e-4, atol=1e-5)
 
 

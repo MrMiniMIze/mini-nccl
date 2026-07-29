@@ -60,9 +60,10 @@ def _battery_worker(pg) -> None:
                     t = _rank_tensor(pg.rank, numel, dtype)
                     c.all_reduce(pg, t, op=op, algorithm=algorithm)
                     expected = _expected_reduce(W, numel, dtype, op)
+                    case = f"{algorithm}/{op}/{dtype}/{numel}"
                     torch.testing.assert_close(
                         t, expected, rtol=1e-4, atol=1e-4,
-                        msg=lambda m: f"all_reduce {algorithm}/{op}/{dtype}/{numel}: {m}",
+                        msg=lambda m, case=case: f"all_reduce {case}: {m}",
                     )
 
     # auto dispatch: small -> tree, large -> ring; both must be correct

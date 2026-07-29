@@ -19,6 +19,7 @@ dev = [
     "pytest>=7.0",
     "numpy",
     "matplotlib",
+    "ruff>=0.6",
 ]
 
 [tool.setuptools.packages.find]
@@ -27,3 +28,19 @@ include = ["mini_nccl*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.ruff]
+line-length = 96
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    "B008",    # function calls in argument defaults: fine for argparse
+    "SIM108",  # ternaries are not always clearer than if/else
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach into internals deliberately, and benchmarks print tables.
+"tests/*" = ["E501"]
+"benchmarks/*" = ["E501"]
