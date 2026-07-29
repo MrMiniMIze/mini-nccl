@@ -26,14 +26,21 @@ Usage::
         model.sync()          # wait for gradient reduction
         optimizer.step()
 
-Not supported (kept out of scope deliberately): unused-parameter detection
-and gradient accumulation across multiple backwards between ``sync()`` calls.
+Gradient accumulation skips the reduction on all but the last microbatch::
+
+    with model.no_sync():
+        loss_a.backward()     # accumulates into bucket buffers, no traffic
+    loss_b.backward()
+    model.sync()              # one reduction covers both backwards
+
+Not supported (kept out of scope deliberately): unused-parameter detection.
 """
 
 from __future__ import annotations
 
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -89,6 +96,7 @@ class DistributedDataParallel(nn.Module):
         self._overlap = overlap and pg.world_size > 1
         self._reduce_future: Future | None = None
         self._buckets: list[_Bucket] = []
+        self._accumulating = False
 
         # Every rank starts from rank 0's weights.
         if pg.world_size > 1:
@@ -128,6 +136,11 @@ class DistributedDataParallel(nn.Module):
 
     def _make_hook(self, bucket: _Bucket):
         def hook(_param: nn.Parameter) -> None:
+            if self._accumulating:
+                # Inside no_sync(): autograd keeps adding into the bucket
+                # buffers (grads are views), so there is nothing to do but
+                # stay off the wire.
+                return
             bucket.mark_ready()
             # The first ready mark of an iteration kicks off the reducer.
             if self._overlap and self._reduce_future is None:
@@ -136,10 +149,34 @@ class DistributedDataParallel(nn.Module):
         return hook
 
     def _reduce_all(self) -> None:
-        for bucket in self._buckets:
+        for i, bucket in enumerate(self._buckets):
             bucket.ready.wait()
-            collectives.all_reduce(self.pg, bucket.buffer, algorithm=self.algorithm)
-            bucket.buffer.div_(self.pg.world_size)
+            ev = self.pg.recorder.start(
+                f"ddp_bucket{i}",
+                self.algorithm,
+                channel=-1,
+                nbytes=bucket.buffer.numel() * bucket.buffer.element_size(),
+                params=len(bucket.params),
+            )
+            try:
+                collectives.all_reduce(self.pg, bucket.buffer, algorithm=self.algorithm)
+                bucket.buffer.div_(self.pg.world_size)
+            finally:
+                self.pg.recorder.finish(ev)
+
+    @contextmanager
+    def no_sync(self):
+        """Accumulate gradients locally without any communication.
+
+        Do not call ``zero_grad()`` inside the block: the point is for the
+        bucket buffers to keep summing across microbatches.
+        """
+        previous = self._accumulating
+        self._accumulating = True
+        try:
+            yield
+        finally:
+            self._accumulating = previous
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)

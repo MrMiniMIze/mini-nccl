@@ -1,9 +1,9 @@
 """mini-nccl: collective communication from first principles.
 
 A small, readable reimplementation of the algorithms inside libraries like
-NCCL (ring and binomial-tree all-reduce, reduce-scatter, all-gather,
-broadcast) over plain TCP sockets, plus a bucketed-overlap DDP wrapper
-built on nothing but these primitives.
+NCCL (ring, binomial-tree, and recursive halving-doubling all-reduce,
+reduce-scatter, all-gather, broadcast, all-to-all) over plain TCP sockets,
+plus a bucketed-overlap DDP wrapper built on nothing but these primitives.
 
 Typical usage inside a worker process::
 
@@ -26,27 +26,64 @@ import os
 import torch
 
 from . import collectives as _c
+from .collectives import ALGORITHMS
 from .ddp import DistributedDataParallel
+from .errors import (
+    CollectiveTimeoutError,
+    MiniNcclError,
+    PeerClosedError,
+    RendezvousError,
+)
 from .launcher import run
-from .process_group import ProcessGroup
+from .process_group import DEFAULT_N_CHANNELS, ProcessGroup
+from .recorder import Recorder
 
 __all__ = [
-    "ProcessGroup",
+    "ALGORITHMS",
+    "DEFAULT_N_CHANNELS",
+    "CollectiveTimeoutError",
     "DistributedDataParallel",
-    "init_process_group",
+    "MiniNcclError",
+    "PeerClosedError",
+    "ProcessGroup",
+    "Recorder",
+    "RendezvousError",
+    "all_gather",
+    "all_reduce",
+    "all_to_all",
+    "barrier",
+    "broadcast",
     "destroy_process_group",
     "get_group",
-    "all_reduce",
-    "broadcast",
-    "all_gather",
+    "init_process_group",
     "reduce_scatter",
-    "barrier",
     "run",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _group: ProcessGroup | None = None
+
+
+def _hosts_from_env() -> list[tuple[str, int]] | None:
+    """Parse ``MINI_NCCL_HOSTS`` ("host:port,host:port,...") if present.
+
+    This is the multi-node entry point: give every rank the same host list
+    and the mesh forms across machines with no other changes.
+    """
+    raw = os.environ.get("MINI_NCCL_HOSTS")
+    if not raw:
+        return None
+    addrs = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        host, _, port = entry.rpartition(":")
+        if not host:
+            raise ValueError(f"MINI_NCCL_HOSTS entry {entry!r} must be host:port")
+        addrs.append((host, int(port)))
+    return addrs
 
 
 def init_process_group(
@@ -54,12 +91,15 @@ def init_process_group(
     world_size: int | None = None,
     addrs: list[tuple[str, int]] | None = None,
     base_port: int | None = None,
+    n_channels: int | None = None,
+    **kwargs,
 ) -> ProcessGroup:
     """Create the default process group.
 
     ``rank`` / ``world_size`` fall back to the ``RANK`` / ``WORLD_SIZE``
-    environment variables (and ``base_port`` to ``MASTER_PORT``) so workers
-    launched by an external runner need no arguments.
+    environment variables, ``base_port`` to ``MASTER_PORT``, ``n_channels``
+    to ``MINI_NCCL_CHANNELS``, and ``addrs`` to ``MINI_NCCL_HOSTS``, so
+    workers launched by an external runner need no arguments.
     """
     global _group
     if _group is not None:
@@ -70,7 +110,18 @@ def init_process_group(
         world_size = int(os.environ["WORLD_SIZE"])
     if base_port is None:
         base_port = int(os.environ.get("MASTER_PORT", "29500"))
-    _group = ProcessGroup(rank, world_size, addrs=addrs, base_port=base_port)
+    if n_channels is None:
+        n_channels = int(os.environ.get("MINI_NCCL_CHANNELS", DEFAULT_N_CHANNELS))
+    if addrs is None:
+        addrs = _hosts_from_env()
+    _group = ProcessGroup(
+        rank,
+        world_size,
+        addrs=addrs,
+        base_port=base_port,
+        n_channels=n_channels,
+        **kwargs,
+    )
     return _group
 
 
@@ -101,6 +152,10 @@ def all_gather(tensor: torch.Tensor) -> list[torch.Tensor]:
 
 def reduce_scatter(tensor: torch.Tensor, op: str = "sum") -> torch.Tensor:
     return _c.reduce_scatter(get_group(), tensor, op=op)
+
+
+def all_to_all(tensor: torch.Tensor) -> torch.Tensor:
+    return _c.all_to_all(get_group(), tensor)
 
 
 def barrier() -> None:

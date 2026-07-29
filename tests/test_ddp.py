@@ -80,6 +80,43 @@ def test_ddp_matches_single_process_world3() -> None:
     run(_parity_battery_worker, 3)
 
 
+def _no_sync_worker(pg, steps: int = 4) -> None:
+    """Two microbatches under no_sync must equal one batch twice the size."""
+    W, micro_batch = pg.world_size, 6
+    model = _make_model()
+    reference = copy.deepcopy(model)
+    ddp = DistributedDataParallel(model, pg)
+    opt = torch.optim.SGD(model.parameters(), lr=0.05)
+    ref_opt = torch.optim.SGD(reference.parameters(), lr=0.05)
+
+    data_gen = torch.Generator().manual_seed(7)
+    for _ in range(steps):
+        total = W * 2 * micro_batch
+        x = torch.randn(total, 16, generator=data_gen)
+        y = torch.randn(total, 1, generator=data_gen)
+        # Rank r owns two consecutive microbatches.
+        first = slice(pg.rank * 2 * micro_batch, pg.rank * 2 * micro_batch + micro_batch)
+        second = slice(first.stop, first.stop + micro_batch)
+
+        ddp.zero_grad()
+        with ddp.no_sync():
+            (F.mse_loss(ddp(x[first]), y[first]) / 2).backward()
+        (F.mse_loss(ddp(x[second]), y[second]) / 2).backward()
+        ddp.sync()
+        opt.step()
+
+        ref_opt.zero_grad()
+        F.mse_loss(reference(x), y).backward()
+        ref_opt.step()
+
+    for p, ref_p in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(p, ref_p, rtol=1e-4, atol=1e-5)
+
+
+def test_no_sync_accumulates_without_communicating() -> None:
+    run(_no_sync_worker, 2)
+
+
 def _broadcast_init_worker(pg) -> None:
     # Ranks start with *different* weights; DDP must sync them to rank 0's.
     torch.manual_seed(100 + pg.rank)

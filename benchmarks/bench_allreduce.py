@@ -2,10 +2,10 @@
 
     python benchmarks/bench_allreduce.py --world-sizes 2,4 --gloo
 
-Measures mini-nccl's ring, tree, and naive algorithms (and optionally
-torch.distributed's gloo backend on identical processes) and writes a CSV
-of algorithm bandwidth (bytes moved / time) and NCCL-convention bus
-bandwidth (algbw * 2(W-1)/W for all-reduce).
+Measures mini-nccl's ring, tree, halving-doubling, and naive algorithms (and
+optionally torch.distributed's gloo backend on identical processes) and
+writes a CSV of algorithm bandwidth (bytes moved / time) and NCCL-convention
+bus bandwidth (algbw * 2(W-1)/W for all-reduce).
 
 Per-config time is the max across ranks of (total loop time / iters): the
 slowest rank defines collective latency, exactly as in nccl-tests.
@@ -22,8 +22,7 @@ import torch
 
 import mini_nccl as mn
 from mini_nccl import collectives as c
-
-ALGORITHMS = ("ring", "tree", "naive")
+from mini_nccl.collectives import ALGORITHMS
 
 
 def _bench_worker(pg, numels, iters, warmup, gloo_port) -> list[tuple[str, int, float]]:
@@ -47,8 +46,7 @@ def _bench_worker(pg, numels, iters, warmup, gloo_port) -> list[tuple[str, int, 
     for numel in numels:
         tensor = torch.randn(numel)
         contenders: list[tuple[str, object]] = [
-            (algo, lambda a=algo: c.all_reduce(pg, tensor, algorithm=a))
-            for algo in ALGORITHMS
+            (algo, lambda a=algo: c.all_reduce(pg, tensor, algorithm=a)) for algo in ALGORITHMS
         ]
         if gloo is not None:
             contenders.append(("gloo", lambda: gloo.all_reduce(tensor)))
@@ -73,6 +71,7 @@ def _bench_worker(pg, numels, iters, warmup, gloo_port) -> list[tuple[str, int, 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--world-sizes", default="2,4")
+    ap.add_argument("--channels", type=int, default=mn.DEFAULT_N_CHANNELS)
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--gloo", action="store_true", help="also benchmark torch.distributed gloo")
@@ -89,18 +88,33 @@ def main() -> None:
     with out_path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
-            ["world", "algorithm", "numel", "bytes", "seconds", "algbw_gbps", "busbw_gbps"]
+            [
+                "world",
+                "channels",
+                "algorithm",
+                "numel",
+                "bytes",
+                "seconds",
+                "algbw_gbps",
+                "busbw_gbps",
+            ]
         )
         for world in world_sizes:
-            print(f"world_size={world}")
+            print(f"world_size={world} channels={args.channels}")
             gloo_port = None
             if args.gloo:
                 from mini_nccl.launcher import _free_ports
 
                 gloo_port = _free_ports(1)[0]
             per_rank = mn.run(
-                _bench_worker, world, numels, args.iters, args.warmup, gloo_port,
+                _bench_worker,
+                world,
+                numels,
+                args.iters,
+                args.warmup,
+                gloo_port,
                 timeout=3600.0,
+                n_channels=args.channels,
             )
             # The slowest rank defines the time for each configuration.
             for i in range(len(per_rank[0])):
@@ -110,7 +124,16 @@ def main() -> None:
                 algbw = nbytes / seconds / 1e9
                 busbw = algbw * 2 * (world - 1) / world
                 writer.writerow(
-                    [world, name, numel, nbytes, f"{seconds:.6e}", f"{algbw:.4f}", f"{busbw:.4f}"]
+                    [
+                        world,
+                        args.channels,
+                        name,
+                        numel,
+                        nbytes,
+                        f"{seconds:.6e}",
+                        f"{algbw:.4f}",
+                        f"{busbw:.4f}",
+                    ]
                 )
 
     print(f"wrote {out_path}")

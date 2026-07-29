@@ -18,7 +18,7 @@ import torch
 from mini_nccl import collectives as c
 from mini_nccl.launcher import run
 
-ALGORITHMS = ("ring", "tree", "naive")
+ALGORITHMS = ("ring", "tree", "halving", "naive")
 # Sizes chosen to hit the edge cases: single element, smaller than the
 # world size, non-divisible by world size, and large enough to span many
 # socket buffers.
@@ -95,6 +95,14 @@ def _battery_worker(pg) -> None:
     torch.testing.assert_close(mine, expected, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(t, original)  # input must be untouched
 
+    # all_to_all: out chunk i is what rank i sent us, i.e. its chunk r
+    numel = 9 * W
+    t = _rank_tensor(pg.rank, numel, torch.float32)
+    out = c.all_to_all(pg, t)
+    for src in range(W):
+        expected = _rank_tensor(src, numel, torch.float32).view(W, -1)[pg.rank]
+        torch.testing.assert_close(out.view(W, -1)[src], expected)
+
     # barrier completes without deadlock
     c.barrier(pg)
 
@@ -102,6 +110,42 @@ def _battery_worker(pg) -> None:
 @pytest.mark.parametrize("world_size", [2, 3, 4])
 def test_collective_battery(world_size: int) -> None:
     run(_battery_worker, world_size)
+
+
+def _multichannel_worker(pg) -> None:
+    """A payload the ring must split across every channel."""
+    assert pg.n_channels == 4
+    numel = 1_000_003  # deliberately divisible by neither channels nor ranks
+    assert c._n_channels_for(pg, numel * 4) == 4, "test must exercise all channels"
+    for algorithm in ("ring", "halving"):
+        t = _rank_tensor(pg.rank, numel, torch.float32)
+        c.all_reduce(pg, t, algorithm=algorithm)
+        torch.testing.assert_close(
+            t, _expected_reduce(pg.world_size, numel, torch.float32, "sum"),
+            rtol=1e-4, atol=1e-3,
+        )
+
+
+def test_multichannel_large_allreduce(monkeypatch) -> None:
+    # Lower the split threshold so a small, fast tensor still spans channels;
+    # spawned workers inherit this environment.
+    monkeypatch.setenv("MINI_NCCL_CHANNEL_MIN_BYTES", str(64 * 1024))
+    run(_multichannel_worker, 4, n_channels=4)
+
+
+def _single_channel_worker(pg) -> None:
+    assert pg.n_channels == 1
+    numel = 1_000_001
+    t = _rank_tensor(pg.rank, numel, torch.float32)
+    c.all_reduce(pg, t, algorithm="ring")
+    torch.testing.assert_close(
+        t, _expected_reduce(pg.world_size, numel, torch.float32, "sum"),
+        rtol=1e-4, atol=1e-3,
+    )
+
+
+def test_single_channel_still_correct() -> None:
+    run(_single_channel_worker, 2, n_channels=1)
 
 
 def _failing_worker(pg) -> None:
