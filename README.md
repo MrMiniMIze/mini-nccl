@@ -13,8 +13,8 @@ character-level GPT whose every gradient byte moves through this library.
 
 No `torch.distributed`, no MPI, no NCCL underneath. The goal is to make the
 machinery of distributed training small enough to read in an afternoon and
-measured well enough to trust, including the three optimizations that
-measured *worse* here and the reason they all failed the same way.
+measured well enough to trust, including the four optimizations that measured
+*worse* here and the single reason they all failed the same way.
 
 ![all-reduce bus bandwidth](docs/img/allreduce_busbw.png)
 
@@ -24,7 +24,8 @@ measured *worse* here and the reason they all failed the same way.
 **If you only read three results:** [ring against
 gloo](#results), [the tuning ablation](#tuning-not-guessing-the-channel-ablation)
 where one optimization measured slower and therefore ships off, and [what
-loopback hides](#what-loopback-teaches-and-what-it-hides).
+loopback hides](#what-loopback-teaches-and-what-it-hides), where a measured
+bandwidth ratio explains all four negative results at once.
 
 ## What's inside
 
@@ -40,7 +41,7 @@ loopback hides](#what-loopback-teaches-and-what-it-hides).
 | Flight recorder | `mini_nccl/recorder.py`, `diagnose.py` | Sequence-numbered collective log, Perfetto traces, desync diagnosis |
 | Launcher | `mini_nccl/launcher.py` | `mn.run(fn, world_size)`: spawn, rendezvous, collect results, notice dead ranks |
 | Examples | `examples/` | Char-level GPT trained data-parallel, the same GPT under FSDP, a tensor-parallel GPT, and a diagnosed hang |
-| Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit, low-precision study |
+| Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit, low-precision study, PCIe copy-ceiling analysis |
 
 ## Quickstart
 
@@ -48,7 +49,7 @@ loopback hides](#what-loopback-teaches-and-what-it-hides).
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 47 tests, world sizes 2-8
+pytest -q                                        # 49 tests, world sizes 2-8
 
 python examples/train_gpt.py --world-size 4 --steps 200 --sample
 python examples/train_gpt.py --world-size 4 --steps 200 --fsdp   # sharded
@@ -58,7 +59,8 @@ python benchmarks/bench_allreduce.py --world-sizes 2,4 --gloo
 python benchmarks/bench_ablation.py              # channel + pipeline tuning
 python benchmarks/fit_cost_model.py              # alpha-beta fit
 python benchmarks/bench_low_precision.py         # bfloat16 wire study
-python benchmarks/bench_device.py                # device staging vs pipelining
+python benchmarks/bench_copy_ceiling.py          # PCIe bandwidth, and the bound it implies
+python benchmarks/bench_device.py --channels 1   # device staging vs pipelining
 ```
 
 The API mirrors `torch.distributed`:
@@ -550,7 +552,7 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q     # 37 tests, ~3.5 min (process spawn dominates)
+pytest -q     # 49 tests, ~5 min (process spawn dominates)
 ```
 
 - **Collectives:** every collective x every algorithm x sum/max/min/prod x
@@ -568,6 +570,11 @@ pytest -q     # 37 tests, ~3.5 min (process spawn dominates)
   layers must stay bitwise identical across ranks.
 - **Low precision:** ring's error grows with world size while tree's does not,
   and a narrow wire still moves the right bits.
+- **Device path:** chunking covers the payload exactly and the pipelined ring
+  agrees with the plain one at every chunk size; on a machine with a GPU, two
+  further tests check both device paths and that the staging is genuinely
+  pinned with its own stream. Those two are what caught the missing cross-stream
+  dependency.
 - **Transport:** full-duplex ring rotation deadlock test, zero-copy
   invariants.
 - **Faults:** a rank dying mid-collective must surface in seconds; a desync
