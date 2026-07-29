@@ -3,7 +3,7 @@ recomputed references.
 
 Each rank derives its input from ``torch.manual_seed(rank)``, so every rank
 can independently reconstruct all inputs and compute the exact expected
-result — no golden files, no cross-process oracles.
+result: no golden files, no cross-process oracles.
 
 To keep process-spawn overhead sane, one worker runs the whole battery of
 (algorithm x op x size x dtype) cases inside a single process group, and the

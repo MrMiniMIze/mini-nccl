@@ -2,8 +2,8 @@
 
     python benchmarks/bench_ddp_overlap.py --world-size 4
 
-Trains the example GPT twice — once with the bucketed-overlap reducer,
-once reducing all buckets serially after backward — and reports mean step
+Trains the example GPT twice, once with the bucketed-overlap reducer and
+once reducing all buckets serially after backward, and reports mean step
 time for each. The gap is the communication cost hidden behind backward.
 """
 

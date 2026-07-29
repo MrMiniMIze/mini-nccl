@@ -2,8 +2,8 @@
 
     python benchmarks/bench_allreduce.py --world-sizes 2,4 --gloo
 
-Measures mini-nccl's ring, tree, and naive algorithms — and optionally
-torch.distributed's gloo backend on identical processes — and writes a CSV
+Measures mini-nccl's ring, tree, and naive algorithms (and optionally
+torch.distributed's gloo backend on identical processes) and writes a CSV
 of algorithm bandwidth (bytes moved / time) and NCCL-convention bus
 bandwidth (algbw * 2(W-1)/W for all-reduce).
 

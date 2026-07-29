@@ -1,4 +1,4 @@
-"""Train a character-level GPT data-parallel — every gradient byte moves
+"""Train a character-level GPT data-parallel. Every gradient byte moves
 through mini-nccl's own ring all-reduce, not torch.distributed.
 
     python examples/train_gpt.py --world-size 4 --steps 200 --sample

@@ -3,8 +3,8 @@
 [![ci](https://github.com/MrMiniMIze/mini-nccl/actions/workflows/ci.yml/badge.svg)](https://github.com/MrMiniMIze/mini-nccl/actions/workflows/ci.yml)
 
 **Collective communication from first principles.** A small, readable
-reimplementation of the algorithms inside libraries like NCCL — ring and
-binomial-tree all-reduce, reduce-scatter, all-gather, broadcast — built on
+reimplementation of the algorithms inside libraries like NCCL (ring and
+binomial-tree all-reduce, reduce-scatter, all-gather, broadcast), built on
 nothing but TCP sockets and PyTorch tensors, plus a bucketed-overlap
 `DistributedDataParallel` built on top of it, and a character-level GPT
 whose every gradient byte moves through this library rather than
@@ -21,10 +21,10 @@ measured enough to trust.
 | Layer | File | What it does |
 |---|---|---|
 | Transport | `mini_nccl/transport.py` | Full-mesh TCP rendezvous, zero-copy receives (`socket.recv_into` straight into tensor storage) |
-| Process group | `mini_nccl/process_group.py` | `send` / `recv` / full-duplex `send_recv` — the three primitives everything else is built from |
+| Process group | `mini_nccl/process_group.py` | `send` / `recv` / full-duplex `send_recv`: the three primitives everything else is built from |
 | Collectives | `mini_nccl/collectives.py` | `all_reduce` (ring / binomial tree / naive), `reduce_scatter`, `all_gather`, `broadcast`, `barrier` |
 | DDP | `mini_nccl/ddp.py` | Gradient bucketing, grads-as-bucket-views, communication/compute overlap on a dedicated reducer thread |
-| Launcher | `mini_nccl/launcher.py` | `mn.run(fn, world_size)` — spawn, rendezvous, collect results, propagate worker tracebacks |
+| Launcher | `mini_nccl/launcher.py` | `mn.run(fn, world_size)`: spawn, rendezvous, collect results, propagate worker tracebacks |
 | Example | `examples/train_gpt.py` | Char-level GPT trained data-parallel on tiny shakespeare |
 | Benchmarks | `benchmarks/` | nccl-tests-style sweep vs `torch.distributed` gloo, overlap timing, chart generation |
 
@@ -65,7 +65,7 @@ while receiving (and reducing into) the next block from its left neighbor.
 After that phase, every rank holds one *fully reduced* block. `W-1`
 **all-gather** steps then circulate the finished blocks around the ring.
 
-Every rank sends `2 (W-1)/W · n` bytes total — asymptotically independent
+Every rank sends `2 (W-1)/W · n` bytes total, asymptotically independent
 of world size. That is the whole magic: add more workers and per-rank
 traffic stays flat. The cost is latency: `2(W-1)` serialized steps.
 
@@ -78,13 +78,13 @@ this is real full-duplex, not time-slicing).
 
 Latency-optimal: reduce up a binomial tree to rank 0 in `⌈log₂ W⌉` steps,
 broadcast back down in `⌈log₂ W⌉` more. Interior ranks forward the full
-payload, so total bytes moved grow with `log W` — worse than ring for large
+payload, so total bytes moved grow with `log W`: worse than ring for large
 tensors, unbeatable for small ones where per-message latency dominates.
 
 ### Algorithm selection
 
 `algorithm="auto"` picks tree at or below `RING_THRESHOLD_BYTES` (256 KiB)
-and ring above it — the same latency-vs-bandwidth decision NCCL's tuner
+and ring above it, the same latency-vs-bandwidth decision NCCL's tuner
 makes. The measured crossover on loopback TCP sits right in that window:
 
 ![all-reduce latency](docs/img/allreduce_latency.png)
@@ -98,7 +98,7 @@ your own fabric from the benchmark CSV.
 tensor to rank 0, which reduces and sends results back. Rank 0 moves
 `O(W · n)` bytes. It's included because the benchmark charts make the point
 better than prose: it looks fine at small scale and falls behind as world
-size and message size grow — exactly why ring algorithms exist.
+size and message size grow, which is exactly why ring algorithms exist.
 
 ### DDP: bucketing, gradient views, overlap
 
@@ -110,28 +110,28 @@ PyTorch's DDP:
   ~`bucket_cap_mb` flat buffers. One all-reduce per bucket instead of one
   per tensor amortizes latency.
 - **Gradient views.** Each `param.grad` is a view into its bucket's flat
-  buffer, so autograd accumulates directly into the communication buffer —
-  zero flatten/unflatten copies.
+  buffer, so autograd accumulates directly into the communication buffer,
+  with zero flatten/unflatten copies.
 - **Overlap.** A post-accumulate-grad hook marks buckets ready; a dedicated
   reducer thread all-reduces each bucket as it completes, while backward is
   still computing earlier layers' gradients.
 - **Determinism invariant.** The reducer processes buckets in fixed index
   order regardless of readiness order, so every rank issues the identical
-  collective sequence — the same invariant NCCL communicators require to
+  collective sequence, the same invariant NCCL communicators require to
   avoid cross-rank deadlock.
 
 Correctness is enforced by the strictest test a DDP can face: training on
 `W` processes (each with `1/W` of the batch) must produce the same
 parameters as single-process full-batch training, step for step, to
-floating-point tolerance — including with 1 KiB buckets and overlap enabled
+floating-point tolerance, including with 1 KiB buckets and overlap enabled
 (`tests/test_ddp.py`).
 
-### What overlap buys — an honest number
+### What overlap buys: an honest number
 
 On this benchmark's CPU-loopback setup, overlap hides only ~2% of step time
 (`benchmarks/bench_ddp_overlap.py`). That is the *correct* result for the
 environment, and worth understanding: overlap pays when communication uses
-a resource distinct from compute — a NIC with DMA, a GPU copy engine, a
+a resource distinct from compute: a NIC with DMA, a GPU copy engine, a
 dedicated fabric. On loopback, "network transfer" is memcpy executed by the
 same CPU cores that backward needs, so there is nothing independent to
 overlap with. The mechanism is what matters; the payoff appears the moment
@@ -141,7 +141,7 @@ the transport stops sharing silicon with the model.
 
 `examples/train_gpt.py` trains a ~1M-parameter character-level GPT on tiny
 shakespeare, data-parallel, with gradients averaged by this library's own
-ring all-reduce — `torch.distributed` is never imported. Two ranks on a
+ring all-reduce; `torch.distributed` is never imported. Two ranks on a
 laptop CPU:
 
 ```
@@ -174,7 +174,7 @@ bandwidth for all-reduce is `algbw · 2(W-1)/W`. Run on loopback TCP,
 
 mini-nccl's ring beats `torch.distributed`'s gloo backend across the small
 and mid range and ties it at 16 MiB; gloo takes the largest size (its
-chunk pipelining starts paying — see roadmap). Loopback numbers compress
+chunk pipelining starts paying; see roadmap). Loopback numbers compress
 real-network differences: on a physical fabric, naive's central bottleneck
 and ring's bandwidth optimality both separate much harder.
 
@@ -186,8 +186,8 @@ pytest -q     # 12 tests, ~50 s (process spawn dominates)
 
 - Every collective × every algorithm × sum/max/min/prod × float32/int64 ×
   sizes chosen to hit edge cases (1 element, fewer elements than ranks,
-  non-divisible sizes, multi-buffer messages), at world sizes 2, 3, and 4 —
-  expected values recomputed independently on every rank from seeds.
+  non-divisible sizes, multi-buffer messages), at world sizes 2, 3, and 4,
+  with expected values recomputed independently on every rank from seeds.
 - DDP parity vs single-process training (overlap on/off, multi-bucket).
 - Transport: full-duplex ring rotation deadlock test, zero-copy invariants,
   worker exception propagation.
@@ -201,16 +201,16 @@ pytest -q     # 12 tests, ~50 s (process spawn dominates)
   identical order on every rank; callers serialize. This is NCCL's contract
   too, and the DDP reducer thread is built around it.
 - **No unused-parameter detection, no gradient accumulation across
-  backwards** — same defaults as `torch.nn.parallel.DistributedDataParallel`,
+  backwards**, the same defaults as `torch.nn.parallel.DistributedDataParallel`,
   kept out to keep the reducer readable.
 - Equal tensor shapes are required on all ranks (NCCL's contract as well).
 
 ## Roadmap
 
 - Chunk pipelining within ring steps (split blocks into slices so a rank
-  starts forwarding a slice while the rest is still arriving) — closes the
+  starts forwarding a slice while the rest is still arriving); closes the
   64 MiB gap to gloo.
-- Recursive halving-doubling all-reduce — better latency×bandwidth product
+- Recursive halving-doubling all-reduce, for a better latency×bandwidth product
   in the mid range.
 - Multi-node support: hostfile-based rendezvous (the address book is
   already a `(host, port)` list; only launch tooling is missing).

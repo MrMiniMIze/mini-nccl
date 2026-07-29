@@ -2,7 +2,7 @@
 
 A ``ProcessGroup`` is intentionally not thread-safe: collectives must be
 issued in the same order on every rank (as with NCCL communicators), so
-callers — including the DDP reducer — serialize onto a single thread.
+callers (including the DDP reducer) serialize onto a single thread.
 The one internal thread is a send worker, which lets ``send_recv`` push to
 one neighbor while the calling thread blocks on the receive from the other;
 that full-duplex step is what makes ring algorithms run at line rate.

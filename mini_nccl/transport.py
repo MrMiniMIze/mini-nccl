@@ -9,7 +9,7 @@ Design notes:
   every exchange inside a collective already agree on element count and
   dtype (the same contract NCCL uses), so headers would be pure overhead.
 - Receives land directly in the destination tensor's storage via
-  ``socket.recv_into`` on a ``memoryview`` — the hot path does no
+  ``socket.recv_into`` on a ``memoryview``; the hot path does no
   Python-side buffer copies.
 """
 

@@ -2,14 +2,14 @@
 
 Three all-reduce strategies, mirroring the trade-offs inside NCCL:
 
-- ``ring``   — bandwidth-optimal. Reduce-scatter then all-gather around a
+- ``ring``: bandwidth-optimal. Reduce-scatter then all-gather around a
   ring; each rank sends ``2(W-1)/W * n`` bytes total regardless of world
   size, but latency grows linearly with ``W`` (2(W-1) serialized steps).
-- ``tree``   — latency-optimal. Binomial-tree reduce to rank 0 followed by
+- ``tree``: latency-optimal. Binomial-tree reduce to rank 0 followed by
   a binomial-tree broadcast: ``2*ceil(log2 W)`` steps, but interior ranks
   forward the full payload, so it moves more bytes than ring on large
   tensors.
-- ``naive``  — the parameter-server baseline: every rank sends to rank 0,
+- ``naive``: the parameter-server baseline; every rank sends to rank 0,
   which reduces and sends the result back. Rank 0 handles ``O(W * n)``
   bytes; included so benchmarks show *why* the other two exist.
 
@@ -24,7 +24,7 @@ import torch
 from .process_group import ProcessGroup
 
 # Crossover point between latency-bound and bandwidth-bound messages.
-# Tune this from benchmarks/bench_allreduce.py results on your own fabric —
+# Tune this from benchmarks/bench_allreduce.py results on your own fabric;
 # on loopback TCP it sits around a few hundred KiB.
 RING_THRESHOLD_BYTES = 256 * 1024
 
@@ -82,7 +82,7 @@ def _ring_all_reduce(pg: ProcessGroup, tensor: torch.Tensor, op: str) -> None:
     right, left = (r + 1) % W, (r - 1) % W
     reduce_op = _OPS[op]
 
-    # Phase 1 — reduce-scatter: after W-1 steps, this rank holds the fully
+    # Phase 1 (reduce-scatter): after W-1 steps, this rank holds the fully
     # reduced block (r + 1) % W. Each step forwards the block we just
     # accumulated while receiving the next partial from the left.
     for step in range(W - 1):
@@ -91,7 +91,7 @@ def _ring_all_reduce(pg: ProcessGroup, tensor: torch.Tensor, op: str) -> None:
         pg.send_recv(blocks[send_idx], right, tmp, left)
         reduce_op(blocks[recv_idx], tmp)
 
-    # Phase 2 — all-gather: circulate the reduced blocks around the ring.
+    # Phase 2 (all-gather): circulate the reduced blocks around the ring.
     for step in range(W - 1):
         send_idx = (r + 1 - step) % W
         recv_idx = (r - step) % W

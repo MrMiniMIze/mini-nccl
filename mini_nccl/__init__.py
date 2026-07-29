@@ -1,8 +1,8 @@
 """mini-nccl: collective communication from first principles.
 
 A small, readable reimplementation of the algorithms inside libraries like
-NCCL — ring and binomial-tree all-reduce, reduce-scatter, all-gather,
-broadcast — over plain TCP sockets, plus a bucketed-overlap DDP wrapper
+NCCL (ring and binomial-tree all-reduce, reduce-scatter, all-gather,
+broadcast) over plain TCP sockets, plus a bucketed-overlap DDP wrapper
 built on nothing but these primitives.
 
 Typical usage inside a worker process::

@@ -8,13 +8,13 @@ reimplemented from scratch:
   backward) into flat buckets of ~``bucket_cap_mb``. One all-reduce per
   bucket amortizes per-message latency across many small tensors.
 - **Gradient views.** Each ``param.grad`` is a view into its bucket's flat
-  buffer, so autograd accumulates directly into the communication buffer —
+  buffer, so autograd accumulates directly into the communication buffer:
   no flatten/unflatten copies on the hot path.
 - **Compute/communication overlap.** A post-accumulate-grad hook marks a
   bucket ready; a dedicated communication thread reduces buckets *while
   backward is still computing* earlier layers' gradients. Buckets are
   always reduced in fixed index order so every rank issues the identical
-  collective sequence — the same invariant NCCL communicators require.
+  collective sequence, the same invariant NCCL communicators require.
 
 Usage::
 

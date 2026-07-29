@@ -120,7 +120,7 @@ def plot_latency(data) -> None:
     ax.set_yscale("log")
     ax.set_ylabel("time per all-reduce (ms)")
     ax.set_title(
-        f"all-reduce latency, {world} ranks — tree wins small, ring wins large",
+        f"all-reduce latency, {world} ranks: tree wins small, ring wins large",
         fontsize=11,
     )
     ax.legend(frameon=False, fontsize=9, labelcolor=INK, loc="upper left")
