@@ -49,6 +49,35 @@ from . import collectives
 from .process_group import ProcessGroup
 
 
+def average_gradients(pg: ProcessGroup, params, algorithm: str = "ring") -> int:
+    """Average the gradients of ``params`` across ``pg``. Returns bytes reduced.
+
+    The explicit form of what DDP's reducer does implicitly, for the cases where
+    hooking into backward is the wrong tool:
+
+    - **Pipeline parallelism** runs backward once per microbatch, so a hook
+      would reduce many times per step instead of once. The gradients want
+      averaging after the whole schedule drains.
+    - **Composed parallelism** needs gradients reduced along one mesh dimension
+      only, over a subgroup rather than the whole world.
+
+    One flat buffer, so it is one collective regardless of parameter count.
+    """
+    if pg.world_size == 1:
+        return 0
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        return 0
+    flat = torch.cat([g.reshape(-1) for g in grads])
+    collectives.all_reduce(pg, flat, algorithm=algorithm)
+    flat.div_(pg.world_size)
+    offset = 0
+    for grad in grads:
+        grad.copy_(flat[offset : offset + grad.numel()].view(grad.shape))
+        offset += grad.numel()
+    return flat.numel() * flat.element_size()
+
+
 class _Bucket:
     def __init__(self, params: list[nn.Parameter], dtype: torch.dtype) -> None:
         self.params = params

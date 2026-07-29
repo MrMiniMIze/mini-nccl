@@ -8,9 +8,9 @@ binomial-tree, and recursive halving-doubling all-reduce, reduce-scatter,
 all-gather, broadcast, and all-to-all, built on nothing but TCP sockets and
 PyTorch tensors. On top of those primitives sit **all four** parallelism
 strategies written from scratch (data parallel, fully sharded, tensor parallel,
-and pipeline) plus the sub-group communicators to compose them, a flight recorder
-that turns a hung job into a named culprit, and a character-level GPT whose every
-gradient byte moves through this library.
+and pipeline) plus the sub-group communicators that compose them into 2D and 3D
+meshes, a flight recorder that turns a hung job into a named culprit, and a
+character-level GPT whose every gradient byte moves through this library.
 
 No `torch.distributed`, no MPI, no NCCL underneath. The goal is to make the
 machinery of distributed training small enough to read in an afternoon and
@@ -41,10 +41,10 @@ bandwidth ratio explains all four negative results at once.
 | FSDP | `mini_nccl/fsdp.py` | Parameter sharding, per-unit all-gather, reduce-scatter gradients, sharded optimizer state, measured memory accounting |
 | Tensor parallel | `mini_nccl/tensor_parallel.py` | Column/row parallel linear, head-split attention with fused-QKV row mapping, Megatron's two autograd functions |
 | Pipeline parallel | `mini_nccl/pipeline.py` | Depth-split stages, 1F1B and GPipe schedules, deadlock-free fused exchange, measured in-flight depth |
-| Mesh | `mini_nccl/mesh.py` | Sub-group communicators as rank-translating views, named parallelism dimensions for 2D composition |
+| Mesh | `mini_nccl/mesh.py` | Sub-group communicators as rank-translating views, named dimensions for 2D and 3D composition |
 | Flight recorder | `mini_nccl/recorder.py`, `diagnose.py` | Sequence-numbered collective log, Perfetto traces, desync diagnosis |
 | Launcher | `mini_nccl/launcher.py` | `mn.run(fn, world_size)`: spawn, rendezvous, collect results, notice dead ranks |
-| Examples | `examples/` | Char-level GPT under DDP and FSDP, a tensor-parallel GPT, a pipeline-parallel GPT, and a diagnosed hang |
+| Examples | `examples/` | Char-level GPT under DDP, FSDP, tensor, pipeline, 2D and 3D meshes, plus a diagnosed hang |
 | Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit, low-precision study, PCIe copy-ceiling analysis |
 
 Every layer is built on the one below it, and nothing reaches past its
@@ -84,13 +84,14 @@ flowchart TB
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 65 tests, world sizes 1-8
+pytest -q                                        # 67 tests, world sizes 1-8
 
 python examples/train_gpt.py --world-size 4 --steps 200 --sample
 python examples/train_gpt.py --world-size 4 --steps 200 --fsdp   # sharded
 python examples/tensor_parallel_gpt.py --world-size 4            # split layers
 python examples/pipeline_gpt.py --world-size 4                   # split depth
-python examples/two_dimensional_gpt.py --world-size 4 --tp 2     # both at once
+python examples/two_dimensional_gpt.py --world-size 4 --tp 2     # tensor x data
+python examples/three_dimensional_gpt.py --world-size 8          # all three
 python examples/desync_demo.py                   # a hang, diagnosed
 python benchmarks/bench_allreduce.py --world-sizes 2,4 --gloo
 python benchmarks/bench_ablation.py              # channel + pipeline tuning
@@ -485,6 +486,41 @@ identical within a tensor group. `examples/two_dimensional_gpt.py` trains the
 GPT this way and confirms the invariant: ranks in the same tensor group report
 losses that agree to `0.00e+00`.
 
+### All three at once
+
+`ParallelMesh(pg, dp=2, pp=2, tp=2)` puts eight ranks in a 2x2x2 grid, where
+each rank holds one **stage** of the model, one **tensor shard** of that stage,
+and belongs to one of two **replicas**. That is the shape large-model training
+actually uses, and each dimension is there for a different reason: tensor
+parallelism makes an oversized layer fit (two all-reduces per block, so it wants
+the fastest links), pipeline parallelism buys depth for one activation per
+boundary, and data parallelism multiplies throughput.
+
+`examples/three_dimensional_gpt.py` trains the GPT across all three:
+
+```
+mesh dp=2 x pp=2 x tp=2  (8 ranks)
+  rank 0: dp=0/2 pp=0/2 tp=0/2
+  tensor group [0, 1] | pipeline group [0, 2] | data group [0, 4]
+  per-rank params 0.22M of 0.85M total (3.9x smaller per rank)
+
+loss spread across the tensor group: 0.00e+00
+```
+
+The three groups are mutually orthogonal (`[0,1]`, `[0,2]`, `[0,4]` share only
+rank 0), and the per-rank parameter count lands at 3.9x against the ideal
+`pp * tp = 4x`. `tests/test_three_dimensional.py` holds the strongest claim in
+the project: gradients from a model split three ways, on eight ranks, match the
+gradients of the whole model trained in one process on the whole batch, checked
+parameter by parameter against the right slice of the reference.
+
+One interaction is worth spelling out because it is the thing that breaks if you
+reach for the familiar tool. **Gradient averaging cannot use a backward hook
+here.** The pipeline runs backward once per microbatch, so a DDP-style hook
+would fire `M` times per step and reduce partial gradients. The reduction has to
+happen once, after the schedule drains, along the data dimension only, which is
+what `average_gradients(dp_group, params)` is for.
+
 ### What loopback teaches, and what it hides
 
 Four separate optimizations in this repo should each be a win, and measured
@@ -706,7 +742,7 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q     # 65 tests, ~7 min (process spawn dominates)
+pytest -q     # 67 tests, ~7 min (process spawn dominates)
 ```
 
 - **Collectives:** every collective x every algorithm x sum/max/min/prod x
@@ -726,9 +762,10 @@ pytest -q     # 65 tests, ~7 min (process spawn dominates)
   single-process training of the whole model, for both schedules and for
   microbatch counts above and below the stage count, plus the 1F1B depth bound
   and GPipe's lack of one.
-- **Composition:** a 2x2 mesh running tensor parallel inside data parallel must
-  match single-process training, collectives must work unchanged on a subgroup,
-  and the two partitions must be provably orthogonal.
+- **Composition:** a 2x2 mesh (tensor inside data) and a 2x2x2 mesh (tensor
+  inside pipeline inside data, on 8 ranks) must both match single-process
+  training gradient by gradient; collectives must work unchanged on a subgroup;
+  and the partitions must be provably orthogonal.
 - **Timing claims:** the flight recorder's own timestamps must show a DDP bucket
   reduction beginning *before* backward returns, and must not when overlap is
   disabled. A "+2%" throughput result cannot distinguish a working mechanism
@@ -781,17 +818,15 @@ to a win.
 - **Pipeline parallel needs a fixed activation shape** and one tensor in, one
   tensor out per stage, the usual restriction: both sides of a boundary size
   their buffers without an extra round trip.
-- **Composition covers 2D, not 3D.** Tensor parallel inside data parallel is
-  implemented and tested; adding pipeline as a third dimension works out of the
-  same mesh but is not yet exercised.
+- **Composition is verified, not tuned.** 2D and 3D meshes are checked for
+  correctness, but which factorization is *fastest* for a given model and fabric
+  is an empirical question this hardware cannot answer.
 - Equal tensor shapes are required on all ranks, as in NCCL.
 
 ## Roadmap
 
-- 3D parallelism: pipeline stages as a third mesh dimension, so tensor parallel
-  sits inside a stage and data parallel wraps the whole thing. The mesh already
-  factors an arbitrary number of dimensions; what is missing is a worked example
-  and its parity test.
+- Interleaved (virtual) pipeline stages, which shrink the bubble further by
+  giving each rank several non-contiguous chunks of the model.
 - Chunk pipelining *across* ring steps (independent chunks flowing through
   the ring simultaneously, rather than slicing within one step), which is how
   gloo takes the 64 MiB 4-rank case.
@@ -822,7 +857,7 @@ mini_nccl/
   launcher.py         # local multi-process runner
 tests/                # collectives, DDP/FSDP/TP/PP parity, faults, precision
 benchmarks/           # sweep, tuning ablation, cost model, precision study
-examples/             # char-GPT (DDP, FSDP, tensor, pipeline, 2D), demos
+examples/             # char-GPT (DDP, FSDP, tensor, pipeline, 2D, 3D), demos
 docs/multinode.md     # running on real hardware
 docs/cuda.md          # the device path, and how to enable it
 ```

@@ -52,6 +52,7 @@ import torch
 from torch import nn
 
 from . import collectives
+from .ddp import average_gradients
 from .process_group import ProcessGroup
 
 _RELEASED = torch.empty(0)
@@ -315,16 +316,7 @@ class FullyShardedDataParallel(nn.Module):
         """
         if self.pg.world_size == 1 or not self._replicated:
             return
-        grads = [p.grad for p in self._replicated if p.grad is not None]
-        if not grads:
-            return
-        flat = torch.cat([g.reshape(-1) for g in grads])
-        collectives.all_reduce(self.pg, flat, algorithm="ring")
-        flat.div_(self.pg.world_size)
-        offset = 0
-        for grad in grads:
-            grad.copy_(flat[offset : offset + grad.numel()].view(grad.shape))
-            offset += grad.numel()
+        average_gradients(self.pg, self._replicated)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         for param in self.parameters():
