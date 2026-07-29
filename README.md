@@ -6,10 +6,10 @@
 reimplementation of the machinery inside libraries like NCCL: ring,
 binomial-tree, and recursive halving-doubling all-reduce, reduce-scatter,
 all-gather, broadcast, and all-to-all, built on nothing but TCP sockets and
-PyTorch tensors. On top of those primitives sit three parallelism strategies
-written from scratch (data parallel, fully sharded, and tensor parallel), a
-flight recorder that turns a hung job into a named culprit, and a
-character-level GPT whose every gradient byte moves through this library.
+PyTorch tensors. On top of those primitives sit **all four** parallelism
+strategies written from scratch (data parallel, fully sharded, tensor parallel,
+and pipeline), a flight recorder that turns a hung job into a named culprit, and
+a character-level GPT whose every gradient byte moves through this library.
 
 No `torch.distributed`, no MPI, no NCCL underneath. The goal is to make the
 machinery of distributed training small enough to read in an afternoon and
@@ -20,7 +20,8 @@ measured well enough to trust, including the four optimizations that measured
 
 **If you only read three files:** `collectives.py` for the algorithms,
 `ddp.py` for how gradients get reduced while backward is still running, and
-`fsdp.py` for how the same primitives shard a model too large to replicate.
+`fsdp.py` or `pipeline.py` for how the same primitives carry a model too large
+to replicate.
 **If you only read three results:** [ring against
 gloo](#results), [the tuning ablation](#tuning-not-guessing-the-channel-ablation)
 where one optimization measured slower and therefore ships off, and [what
@@ -38,9 +39,10 @@ bandwidth ratio explains all four negative results at once.
 | DDP | `mini_nccl/ddp.py` | Gradient bucketing, grads-as-bucket-views, overlap on a reducer thread, `no_sync()` accumulation |
 | FSDP | `mini_nccl/fsdp.py` | Parameter sharding, per-unit all-gather, reduce-scatter gradients, sharded optimizer state, measured memory accounting |
 | Tensor parallel | `mini_nccl/tensor_parallel.py` | Column/row parallel linear, head-split attention with fused-QKV row mapping, Megatron's two autograd functions |
+| Pipeline parallel | `mini_nccl/pipeline.py` | Depth-split stages, 1F1B and GPipe schedules, deadlock-free fused exchange, measured in-flight depth |
 | Flight recorder | `mini_nccl/recorder.py`, `diagnose.py` | Sequence-numbered collective log, Perfetto traces, desync diagnosis |
 | Launcher | `mini_nccl/launcher.py` | `mn.run(fn, world_size)`: spawn, rendezvous, collect results, notice dead ranks |
-| Examples | `examples/` | Char-level GPT trained data-parallel, the same GPT under FSDP, a tensor-parallel GPT, and a diagnosed hang |
+| Examples | `examples/` | Char-level GPT under DDP and FSDP, a tensor-parallel GPT, a pipeline-parallel GPT, and a diagnosed hang |
 | Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit, low-precision study, PCIe copy-ceiling analysis |
 
 ## Quickstart
@@ -49,11 +51,12 @@ bandwidth ratio explains all four negative results at once.
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 49 tests, world sizes 2-8
+pytest -q                                        # 57 tests, world sizes 1-8
 
 python examples/train_gpt.py --world-size 4 --steps 200 --sample
 python examples/train_gpt.py --world-size 4 --steps 200 --fsdp   # sharded
 python examples/tensor_parallel_gpt.py --world-size 4            # split layers
+python examples/pipeline_gpt.py --world-size 4                   # split depth
 python examples/desync_demo.py                   # a hang, diagnosed
 python benchmarks/bench_allreduce.py --world-sizes 2,4 --gloo
 python benchmarks/bench_ablation.py              # channel + pipeline tuning
@@ -357,6 +360,49 @@ replicas would drift apart silently over thousands of steps, so
 tensor-parallel GPT reports the same loss on all four ranks to the last bit
 (`max disagreement: 0.00e+00`).
 
+### Pipeline parallel: splitting the stack, and paying for the bubble
+
+Tensor parallelism splits a layer; pipeline parallelism splits the *stack*.
+Rank `s` owns a contiguous run of blocks, activations flow forward and gradients
+flow back, and only one tensor crosses each boundary in each direction. That
+makes it the cheapest model parallelism in bytes moved and the fussiest to
+schedule, because the obvious version leaves `W-1` of `W` ranks idle.
+
+Splitting the batch into `M` microbatches fixes that, shrinking the idle
+fraction to `(W-1)/(M+W-1)`. Two schedules reach the same bubble with very
+different memory:
+
+- **GPipe** runs all `M` forwards, then all `M` backwards. Every microbatch's
+  activations stay alive until its backward, so depth is `M` on every stage.
+- **1F1B** (PipeDream-Flush, what Megatron uses) warms up stage `s` with
+  `W-1-s` forwards, then alternates one forward with one backward. Depth is
+  bounded by `W-s`, so **activation memory stops depending on `M`**.
+
+`examples/pipeline_gpt.py` measures the depth rather than asserting it, and the
+two schedules come out exactly where the theory says (4 stages, 8 microbatches):
+
+| schedule | microbatches in flight per stage | bubble |
+|---|---|---|
+| GPipe | `[8, 8, 8, 8]` | 27.3% |
+| **1F1B** | `[4, 3, 2, 1]` | 27.3% |
+| 1F1B bound `W-s` | `[4, 3, 2, 1]` | |
+
+Same bubble, 2x less peak activation memory on the busiest stage, and the bound
+is hit exactly. Both schedules start from an identical loss, which is the
+verification that they are two orderings of the same arithmetic.
+
+**The deadlock, and why the fused exchange exists.** A stage pushing an
+activation forward while its neighbor pushes a gradient back is a genuine hazard
+once activations exceed the socket buffer: both block on `send`, neither drains
+the other. The steady state therefore performs one *fused* exchange (send on a
+worker thread while receiving on the calling one), which is the same fix
+Megatron applies with batched isend/irecv. The subtlety underneath it: the
+gradient arriving from the next stage belongs to the *oldest* microbatch in
+flight, not the one just pushed forward, because the next stage is several
+microbatches behind on its own schedule. That is what the FIFO queue is for, and
+getting it wrong produces a pipeline that still runs and still converges to
+something wrong. Hence a numeric parity test rather than a smoke test.
+
 ### What loopback teaches, and what it hides
 
 Four separate optimizations in this repo should each be a win, and measured
@@ -552,7 +598,7 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q     # 49 tests, ~5 min (process spawn dominates)
+pytest -q     # 57 tests, ~6 min (process spawn dominates)
 ```
 
 - **Collectives:** every collective x every algorithm x sum/max/min/prod x
@@ -568,6 +614,10 @@ pytest -q     # 49 tests, ~5 min (process spawn dominates)
 - **Tensor parallel:** outputs *and* gradients against an unsharded reference
   for the MLP and for attention with fused-QKV row mapping, and replicated
   layers must stay bitwise identical across ranks.
+- **Pipeline parallel:** per-stage gradients and the loss against
+  single-process training of the whole model, for both schedules and for
+  microbatch counts above and below the stage count, plus the 1F1B depth bound
+  and GPipe's lack of one.
 - **Low precision:** ring's error grows with world size while tree's does not,
   and a narrow wire still moves the right bits.
 - **Device path:** chunking covers the payload exactly and the pipelined ring
@@ -613,13 +663,19 @@ to a win.
   transformer block), and it recomputes rather than refilling freed storage.
 - **Tensor parallel has no vocab-parallel embedding**, so embeddings and the
   tied head stay replicated.
-- **No pipeline parallelism.** Of the four strategies, the 1F1B schedule is
-  the one still missing.
+- **Pipeline parallel needs a fixed activation shape** and one tensor in, one
+  tensor out per stage, the usual restriction: both sides of a boundary size
+  their buffers without an extra round trip.
+- **The strategies do not compose.** Each is implemented and tested on its own;
+  2D or 3D combinations (tensor parallel inside pipeline stages inside data
+  parallel replicas) are the next structural step, not a flag.
 - Equal tensor shapes are required on all ranks, as in NCCL.
 
 ## Roadmap
 
-- Pipeline parallelism with a 1F1B schedule, completing the set.
+- Compose the strategies: tensor parallel within a pipeline stage, pipeline
+  replicas under data parallel. That needs sub-groups (a communicator over a
+  subset of ranks), which the process group does not have yet.
 - Chunk pipelining *across* ring steps (independent chunks flowing through
   the ring simultaneously, rather than slicing within one step), which is how
   gloo takes the 64 MiB 4-rank case.
@@ -642,13 +698,14 @@ mini_nccl/
   ddp.py              # buckets, gradient views, overlap reducer, no_sync
   fsdp.py             # parameter sharding, per-unit gather, sharded optimizer
   tensor_parallel.py  # column/row parallel layers, head-split attention
+  pipeline.py         # depth-split stages, 1F1B and GPipe schedules
   device.py           # pinned staging, copy/network pipeline for GPU tensors
   recorder.py         # flight recorder
   diagnose.py         # desync analysis and Perfetto trace merging
   launcher.py         # local multi-process runner
-tests/                # collectives, DDP/FSDP/TP parity, faults, precision
+tests/                # collectives, DDP/FSDP/TP/PP parity, faults, precision
 benchmarks/           # sweep, tuning ablation, cost model, precision study
-examples/             # char-GPT (DDP and FSDP), tensor-parallel GPT, demos
+examples/             # char-GPT (DDP, FSDP, tensor parallel, pipeline), demos
 docs/multinode.md     # running on real hardware
 docs/cuda.md          # the device path, and how to enable it
 ```

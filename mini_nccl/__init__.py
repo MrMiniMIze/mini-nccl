@@ -3,10 +3,11 @@
 A small, readable reimplementation of the algorithms inside libraries like
 NCCL (ring, binomial-tree, and recursive halving-doubling all-reduce,
 reduce-scatter, all-gather, broadcast, all-to-all) over plain TCP sockets,
-plus three parallelism strategies built on nothing but those primitives:
+plus all four parallelism strategies built on nothing but those primitives:
 ``DistributedDataParallel`` (bucketed, overlapped),
-``FullyShardedDataParallel`` (sharded parameters and optimizer state), and the
-column/row parallel layers in ``tensor_parallel``.
+``FullyShardedDataParallel`` (sharded parameters and optimizer state), the
+column/row parallel layers in ``tensor_parallel``, and ``PipelineParallel``
+(depth-split stages with a 1F1B schedule).
 
 Typical usage inside a worker process::
 
@@ -39,6 +40,7 @@ from .errors import (
 )
 from .fsdp import FullyShardedDataParallel
 from .launcher import run
+from .pipeline import PipelineParallel
 from .process_group import DEFAULT_N_CHANNELS, ProcessGroup
 from .recorder import Recorder
 
@@ -50,6 +52,7 @@ __all__ = [
     "FullyShardedDataParallel",
     "MiniNcclError",
     "PeerClosedError",
+    "PipelineParallel",
     "ProcessGroup",
     "Recorder",
     "RendezvousError",
@@ -65,7 +68,7 @@ __all__ = [
     "run",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 _group: ProcessGroup | None = None
 
