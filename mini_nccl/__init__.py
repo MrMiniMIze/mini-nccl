@@ -7,7 +7,8 @@ plus all four parallelism strategies built on nothing but those primitives:
 ``DistributedDataParallel`` (bucketed, overlapped),
 ``FullyShardedDataParallel`` (sharded parameters and optimizer state), the
 column/row parallel layers in ``tensor_parallel``, and ``PipelineParallel``
-(depth-split stages with a 1F1B schedule).
+(depth-split stages with a 1F1B schedule). ``ParallelMesh`` composes them by
+handing each strategy a communicator over its own subset of ranks.
 
 Typical usage inside a worker process::
 
@@ -40,6 +41,7 @@ from .errors import (
 )
 from .fsdp import FullyShardedDataParallel
 from .launcher import run
+from .mesh import ParallelMesh, SubGroup
 from .pipeline import PipelineParallel
 from .process_group import DEFAULT_N_CHANNELS, ProcessGroup
 from .recorder import Recorder
@@ -51,11 +53,13 @@ __all__ = [
     "DistributedDataParallel",
     "FullyShardedDataParallel",
     "MiniNcclError",
+    "ParallelMesh",
     "PeerClosedError",
     "PipelineParallel",
     "ProcessGroup",
     "Recorder",
     "RendezvousError",
+    "SubGroup",
     "all_gather",
     "all_reduce",
     "all_to_all",
@@ -68,7 +72,7 @@ __all__ = [
     "run",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 _group: ProcessGroup | None = None
 

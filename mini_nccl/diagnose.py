@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 from pathlib import Path
 
 CHANNEL_LABEL = {-1: "collective order"}
@@ -88,6 +89,76 @@ def _find_divergence(streams: dict[int, dict[int, dict]]) -> int:
     return 0
 
 
+def _straggler_report(
+    states: list[dict], factor: float = 1.5, min_samples: int = 3
+) -> None:
+    """Name the rank the others are waiting for.
+
+    A rank that is slow rather than wrong produces no desync and no unfinished
+    collective: the job completes, at the pace of its worst member. It is
+    visible here instead, through a signal that is worth stating carefully
+    because the obvious version of it is backwards.
+
+    The straggler does **not** spend longer inside its collectives. It spends
+    *less*. Arriving last means it finds its peers already waiting, so it
+    returns almost immediately, while every rank that arrived on time sits
+    blocked until it shows up. So the rank to look at is the one whose
+    collectives are consistently the *fastest*.
+
+    Using durations rather than entry timestamps also keeps this usable across
+    machines, where wall clocks need not agree closely enough to rank arrival
+    order. Reported as information: a straggler is a performance problem, so it
+    does not change the exit code.
+
+    Operations called fewer than ``min_samples`` times per rank are skipped. One
+    observation cannot establish that a rank is *consistently* slow, and letting
+    a single barrier weigh as much as a hundred all-reduces is enough to hide a
+    real straggler.
+    """
+    if len(states) < 3:
+        return  # with two ranks there is no majority to compare against
+
+    per_rank_op: dict[int, dict[str, list[float]]] = {}
+    for state in states:
+        by_op: dict[str, list[float]] = {}
+        for ev in state["events"]:
+            if ev["dur_us"] is not None and ev["channel"] == -1:
+                by_op.setdefault(ev["op"], []).append(ev["dur_us"])
+        per_rank_op[state["rank"]] = by_op
+
+    ops = sorted({op for by_op in per_rank_op.values() for op in by_op})
+    fast_counts: dict[int, int] = dict.fromkeys(per_rank_op, 0)
+    comparable = 0
+    for op in ops:
+        medians = {
+            rank: statistics.median(by_op[op])
+            for rank, by_op in per_rank_op.items()
+            if len(by_op.get(op, ())) >= min_samples
+        }
+        if len(medians) < 3:
+            continue
+        comparable += 1
+        across = statistics.median(medians.values())
+        if across <= 0:
+            continue
+        for rank, value in medians.items():
+            if value * factor < across:
+                fast_counts[rank] += 1
+
+    if not comparable:
+        return
+    for rank, count in sorted(fast_counts.items()):
+        if count > comparable / 2:
+            print(
+                f"\nSTRAGGLER: rank {rank} spent less than 1/{factor:g} of the "
+                f"median time inside {count} of {comparable} collectives.\n"
+                f"  That is the signature of the rank everyone else waits for: it "
+                f"arrives last, finds its peers already blocked, and returns at "
+                f"once. Look for a slower host, an unbalanced shard, or contention "
+                f"on that rank rather than at the ranks reporting long waits."
+            )
+
+
 def report(states: list[dict]) -> int:
     """Print a diagnosis. Returns a shell exit code (0 clean, 1 suspicious)."""
     world = states[0]["world_size"]
@@ -110,6 +181,7 @@ def report(states: list[dict]) -> int:
 
     streams = _order_streams(states)
     findings += _find_divergence(streams)
+    _straggler_report(states)
 
     for s in states:
         for ev in s["pending"]:

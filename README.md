@@ -8,8 +8,9 @@ binomial-tree, and recursive halving-doubling all-reduce, reduce-scatter,
 all-gather, broadcast, and all-to-all, built on nothing but TCP sockets and
 PyTorch tensors. On top of those primitives sit **all four** parallelism
 strategies written from scratch (data parallel, fully sharded, tensor parallel,
-and pipeline), a flight recorder that turns a hung job into a named culprit, and
-a character-level GPT whose every gradient byte moves through this library.
+and pipeline) plus the sub-group communicators to compose them, a flight recorder
+that turns a hung job into a named culprit, and a character-level GPT whose every
+gradient byte moves through this library.
 
 No `torch.distributed`, no MPI, no NCCL underneath. The goal is to make the
 machinery of distributed training small enough to read in an afternoon and
@@ -40,10 +41,42 @@ bandwidth ratio explains all four negative results at once.
 | FSDP | `mini_nccl/fsdp.py` | Parameter sharding, per-unit all-gather, reduce-scatter gradients, sharded optimizer state, measured memory accounting |
 | Tensor parallel | `mini_nccl/tensor_parallel.py` | Column/row parallel linear, head-split attention with fused-QKV row mapping, Megatron's two autograd functions |
 | Pipeline parallel | `mini_nccl/pipeline.py` | Depth-split stages, 1F1B and GPipe schedules, deadlock-free fused exchange, measured in-flight depth |
+| Mesh | `mini_nccl/mesh.py` | Sub-group communicators as rank-translating views, named parallelism dimensions for 2D composition |
 | Flight recorder | `mini_nccl/recorder.py`, `diagnose.py` | Sequence-numbered collective log, Perfetto traces, desync diagnosis |
 | Launcher | `mini_nccl/launcher.py` | `mn.run(fn, world_size)`: spawn, rendezvous, collect results, notice dead ranks |
 | Examples | `examples/` | Char-level GPT under DDP and FSDP, a tensor-parallel GPT, a pipeline-parallel GPT, and a diagnosed hang |
 | Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit, low-precision study, PCIe copy-ceiling analysis |
+
+Every layer is built on the one below it, and nothing reaches past its
+neighbour:
+
+```mermaid
+flowchart TB
+    subgraph S["parallelism strategies"]
+        direction LR
+        DDP["DDP<br/>bucketed, overlapped"]
+        FSDP["FSDP<br/>sharded params + optimizer"]
+        TP["tensor parallel<br/>split a layer"]
+        PP["pipeline parallel<br/>split the stack"]
+    end
+    M["ParallelMesh / SubGroup<br/>rank-translating views, no new sockets"]
+    subgraph C["collectives"]
+        direction LR
+        AR["all_reduce<br/>ring / tree / halving / naive"]
+        OTHER["reduce_scatter · all_gather<br/>broadcast · all_to_all · barrier"]
+    end
+    PG["process group<br/>send · recv · full-duplex and sliced send_recv"]
+    subgraph T["transport"]
+        direction LR
+        SOCK["TCP full mesh<br/>channels · timeouts · zero-copy receives"]
+        DEV["device staging<br/>pinned host buffers · CUDA streams"]
+    end
+    R["flight recorder<br/>sequence numbers · traces · desync and straggler diagnosis"]
+
+    S --> M --> C --> PG --> T
+    R -.observes.-> C
+    R -.observes.-> PG
+```
 
 ## Quickstart
 
@@ -51,12 +84,13 @@ bandwidth ratio explains all four negative results at once.
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 57 tests, world sizes 1-8
+pytest -q                                        # 65 tests, world sizes 1-8
 
 python examples/train_gpt.py --world-size 4 --steps 200 --sample
 python examples/train_gpt.py --world-size 4 --steps 200 --fsdp   # sharded
 python examples/tensor_parallel_gpt.py --world-size 4            # split layers
 python examples/pipeline_gpt.py --world-size 4                   # split depth
+python examples/two_dimensional_gpt.py --world-size 4 --tp 2     # both at once
 python examples/desync_demo.py                   # a hang, diagnosed
 python benchmarks/bench_allreduce.py --world-sizes 2,4 --gloo
 python benchmarks/bench_ablation.py              # channel + pipeline tuning
@@ -403,6 +437,54 @@ microbatches behind on its own schedule. That is what the FIFO queue is for, and
 getting it wrong produces a pipeline that still runs and still converges to
 something wrong. Hence a numeric parity test rather than a smoke test.
 
+### Composing them: sub-groups and a 2D mesh
+
+Four strategies that each work alone are four strategies, not a stack. Real
+training composes them, and doing that needs communicators over *subsets* of
+ranks: a tensor-parallel all-reduce must reach only the ranks sharing that
+layer, while a data-parallel all-reduce must reach only the corresponding ranks
+of each replica.
+
+A `SubGroup` is a **view**, not a second connection mesh. The parent group
+already holds a socket to every peer, so a subgroup only translates its local
+rank numbering onto the parent's and reuses them. Nothing reconnects and no
+threads are added.
+
+That it works at all is a statement about the interfaces. Every collective here
+is written against nine members (`rank`, `world_size`, `send`, `recv`,
+`send_recv`, `send_recv_sliced`, `run_per_channel`, `recorder`, `n_channels`),
+so a subgroup that implements those with translation runs ring all-reduce, FSDP,
+tensor parallel, and the pipeline schedules **unchanged**. Composition needed no
+edits to any of them.
+
+`ParallelMesh` factors the ranks into named dimensions:
+
+```python
+mesh = ParallelMesh(pg, dp=2, tp=2)               # 4 ranks as a 2x2 grid
+mlp = ParallelMLP(width, mesh.group("tp"))        # layer split across tp
+model = DistributedDataParallel(model, mesh.group("dp"))   # grads across dp
+```
+
+With the last dimension fastest, the tensor groups are `[0,1]` and `[2,3]` while
+the data groups are `[0,2]` and `[1,3]`. Two properties fall out of that
+layout, and both matter:
+
+- **Contiguous ranks share a tensor group**, which is what you want when
+  neighbouring ranks share the faster interconnect.
+- **The partitions are orthogonal**, so any two ranks share at most one
+  dimension's group and the two kinds of traffic never contend for a socket.
+  That is what makes the ordering invariant safe without any extra locking, and
+  `tests/test_mesh.py` asserts the orthogonality directly.
+
+The gradient rule is the part worth getting right: sharded weights are reduced
+**only** along the data dimension, since each tensor-parallel rank owns a
+different slice and there is nothing to average along that axis. Replicated
+weights are also reduced only along the data dimension, because the backward
+all-reduce inside the tensor-parallel layers has already made their gradients
+identical within a tensor group. `examples/two_dimensional_gpt.py` trains the
+GPT this way and confirms the invariant: ranks in the same tensor group report
+losses that agree to `0.00e+00`.
+
 ### What loopback teaches, and what it hides
 
 Four separate optimizations in this repo should each be a win, and measured
@@ -574,6 +656,32 @@ hard (`os._exit`, OOM killer, segfault) never reports, so `run()` watches
 process exits and says `rank 1 exited with code 9 without reporting` in
 about a second instead of waiting out the timeout.
 
+**Stragglers, and why the obvious signal is backwards.** A rank that is merely
+slow produces no desync and no unfinished collective: the job completes, at the
+pace of its worst member. `diagnose` finds it from the same timings, using a
+signal that is easy to get inverted (I did, first time). The straggler does not
+spend *longer* inside its collectives. It spends **less**: arriving last, it
+finds its peers already blocked and returns almost immediately, while everyone
+who arrived on time waits for it. Measured on a deliberately delayed rank, that
+is a 35x gap in the right direction:
+
+```
+rank 0: all_reduce median 21054us      <- waiting
+rank 1: all_reduce median 21030us      <- waiting
+rank 2: all_reduce median   591us      <- the straggler
+rank 3: all_reduce median 21081us      <- waiting
+
+STRAGGLER: rank 2 spent less than 1/1.5 of the median time inside 1 of 1 collectives.
+  That is the signature of the rank everyone else waits for: it arrives last,
+  finds its peers already blocked, and returns at once.
+```
+
+Using durations rather than arrival timestamps also keeps this working across
+machines, where wall clocks need not agree closely enough to rank arrival order.
+Operations called fewer than three times are ignored, because one observation
+cannot establish that a rank is *consistently* slow, and letting a single barrier
+weigh as much as a hundred all-reduces was enough to hide the straggler above.
+
 ## The proof: a GPT trained entirely through mini-nccl
 
 `examples/train_gpt.py` trains a ~1M-parameter character-level GPT on tiny
@@ -598,7 +706,7 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q     # 57 tests, ~6 min (process spawn dominates)
+pytest -q     # 65 tests, ~7 min (process spawn dominates)
 ```
 
 - **Collectives:** every collective x every algorithm x sum/max/min/prod x
@@ -618,6 +726,13 @@ pytest -q     # 57 tests, ~6 min (process spawn dominates)
   single-process training of the whole model, for both schedules and for
   microbatch counts above and below the stage count, plus the 1F1B depth bound
   and GPipe's lack of one.
+- **Composition:** a 2x2 mesh running tensor parallel inside data parallel must
+  match single-process training, collectives must work unchanged on a subgroup,
+  and the two partitions must be provably orthogonal.
+- **Timing claims:** the flight recorder's own timestamps must show a DDP bucket
+  reduction beginning *before* backward returns, and must not when overlap is
+  disabled. A "+2%" throughput result cannot distinguish a working mechanism
+  from a broken one, so the mechanism is asserted separately.
 - **Low precision:** ring's error grows with world size while tree's does not,
   and a narrow wire still moves the right bits.
 - **Device path:** chunking covers the payload exactly and the pipelined ring
@@ -666,16 +781,17 @@ to a win.
 - **Pipeline parallel needs a fixed activation shape** and one tensor in, one
   tensor out per stage, the usual restriction: both sides of a boundary size
   their buffers without an extra round trip.
-- **The strategies do not compose.** Each is implemented and tested on its own;
-  2D or 3D combinations (tensor parallel inside pipeline stages inside data
-  parallel replicas) are the next structural step, not a flag.
+- **Composition covers 2D, not 3D.** Tensor parallel inside data parallel is
+  implemented and tested; adding pipeline as a third dimension works out of the
+  same mesh but is not yet exercised.
 - Equal tensor shapes are required on all ranks, as in NCCL.
 
 ## Roadmap
 
-- Compose the strategies: tensor parallel within a pipeline stage, pipeline
-  replicas under data parallel. That needs sub-groups (a communicator over a
-  subset of ranks), which the process group does not have yet.
+- 3D parallelism: pipeline stages as a third mesh dimension, so tensor parallel
+  sits inside a stage and data parallel wraps the whole thing. The mesh already
+  factors an arbitrary number of dimensions; what is missing is a worked example
+  and its parity test.
 - Chunk pipelining *across* ring steps (independent chunks flowing through
   the ring simultaneously, rather than slicing within one step), which is how
   gloo takes the 64 MiB 4-rank case.
@@ -699,13 +815,14 @@ mini_nccl/
   fsdp.py             # parameter sharding, per-unit gather, sharded optimizer
   tensor_parallel.py  # column/row parallel layers, head-split attention
   pipeline.py         # depth-split stages, 1F1B and GPipe schedules
+  mesh.py             # sub-group communicators, named parallelism dimensions
   device.py           # pinned staging, copy/network pipeline for GPU tensors
   recorder.py         # flight recorder
   diagnose.py         # desync analysis and Perfetto trace merging
   launcher.py         # local multi-process runner
 tests/                # collectives, DDP/FSDP/TP/PP parity, faults, precision
 benchmarks/           # sweep, tuning ablation, cost model, precision study
-examples/             # char-GPT (DDP, FSDP, tensor parallel, pipeline), demos
+examples/             # char-GPT (DDP, FSDP, tensor, pipeline, 2D), demos
 docs/multinode.md     # running on real hardware
 docs/cuda.md          # the device path, and how to enable it
 ```
