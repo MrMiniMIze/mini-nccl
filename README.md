@@ -42,6 +42,7 @@ bandwidth ratio explains all four negative results at once.
 | Tensor parallel | `mini_nccl/tensor_parallel.py` | Column/row parallel linear, head-split attention with fused-QKV row mapping, Megatron's two autograd functions |
 | Pipeline parallel | `mini_nccl/pipeline.py` | Depth-split stages, 1F1B and GPipe schedules, deadlock-free fused exchange, measured in-flight depth |
 | Mesh | `mini_nccl/mesh.py` | Sub-group communicators as rank-translating views, named dimensions for 2D and 3D composition |
+| Interface | `mini_nccl/communicator.py` | The nine-member `Protocol` every collective is written against, so subgroup substitutability is type-checked |
 | Flight recorder | `mini_nccl/recorder.py`, `diagnose.py` | Sequence-numbered collective log, Perfetto traces, desync diagnosis |
 | Launcher | `mini_nccl/launcher.py` | `mn.run(fn, world_size)`: spawn, rendezvous, collect results, notice dead ranks |
 | Examples | `examples/` | Char-level GPT under DDP, FSDP, tensor, pipeline, 2D and 3D meshes, plus a diagnosed hang |
@@ -84,7 +85,8 @@ flowchart TB
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 67 tests, world sizes 1-8
+pytest -q                                        # 70 tests, world sizes 1-8
+mypy mini_nccl --ignore-missing-imports          # clean across 15 modules
 
 python examples/train_gpt.py --world-size 4 --steps 200 --sample
 python examples/train_gpt.py --world-size 4 --steps 200 --fsdp   # sharded
@@ -452,11 +454,12 @@ rank numbering onto the parent's and reuses them. Nothing reconnects and no
 threads are added.
 
 That it works at all is a statement about the interfaces. Every collective here
-is written against nine members (`rank`, `world_size`, `send`, `recv`,
-`send_recv`, `send_recv_sliced`, `run_per_channel`, `recorder`, `n_channels`),
-so a subgroup that implements those with translation runs ring all-reduce, FSDP,
-tensor parallel, and the pipeline schedules **unchanged**. Composition needed no
-edits to any of them.
+is written against nine members, declared as a `Protocol` in
+`communicator.py` so the claim is type-checked rather than asserted: `rank`,
+`world_size`, `send`, `recv`, `send_recv`, `send_recv_sliced`,
+`run_per_channel`, `recorder`, `n_channels`. A subgroup implements those with
+translation and therefore runs ring all-reduce, FSDP, tensor parallel, and the
+pipeline schedules **unchanged**. Composition needed no edits to any of them.
 
 `ParallelMesh` factors the ranks into named dimensions:
 
@@ -742,7 +745,12 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q     # 67 tests, ~7 min (process spawn dominates)
+pytest -q     # 70 tests, ~10 min (process spawn dominates)
+
+# Coverage needs multiprocessing awareness or it only sees the parent process
+# and reports about 24% against a real 93%.
+COVERAGE_PROCESS_START=$PWD/pyproject.toml coverage run -m pytest -q
+coverage combine && coverage report
 ```
 
 - **Collectives:** every collective x every algorithm x sum/max/min/prod x
@@ -790,6 +798,70 @@ pytest -q     # 67 tests, ~7 min (process spawn dominates)
 - **Bootstrap:** two independently launched processes must find each other
   from environment variables alone, with no launcher wiring them together.
   That is the path a real cluster uses.
+
+## What review found
+
+Everything above was written by one person moving fast, so it got an
+independent review pass: three reviewers with fresh eyes over the subtlest
+modules, plus a type check and an honest coverage measurement. That turned up
+two real bugs, both of which are now fixed with regression tests, and both of
+which are worth recording because of *how* they hid.
+
+**FSDP produced silently wrong gradients for any unit containing dropout.**
+Backward recomputes a unit's forward, and the recompute has to reproduce the
+original exactly, which means rewinding the random number generator. It did
+not, so a second dropout mask was drawn and gradients were taken against a
+graph that never produced the loss. `torch.utils.checkpoint` handles this for
+the same reason.
+
+What makes it worth writing down is that the failure is *selectively*
+invisible. Layers downstream of the unit still receive perfect gradients,
+because those come from the original forward. My first attempt to reproduce it
+checked the model head, saw a difference of exactly `0.000000`, and concluded
+there was no bug. Only the sharded units' own gradients are wrong, and they
+were off by 0.35 out of a gradient of similar magnitude. The regression test
+therefore checks the shards specifically, and says in a comment why checking
+the head would pass while the model quietly failed to train.
+
+**A failed rendezvous leaked its listening socket and the thread holding it.**
+The accepter thread parks in `accept()`; on failure nothing told it to stop, so
+it kept the port bound for the life of the process. A caller that caught
+`RendezvousError` and retried in the same process then died with "address
+already in use" *on its own address*, which reads like a configuration problem
+rather than a leak. The repo's own test harness masked it completely, because
+every rank is a separate process that exits on failure. Fixed by polling the
+accept with a stop flag and closing everything on the failure path. I verified
+the new test fails when the fix is removed, since a regression test nobody has
+seen fail is only a hope.
+
+Alongside those:
+
+- **`mypy` is clean** across all 15 modules and runs in CI. Getting there was
+  not busywork: it surfaced an incompatible `named_parameters` override that
+  would have raised `TypeError` for any torch internal passing
+  `remove_duplicate=`, and a `float | None` timeout annotated as `float`.
+- **The interface claim is now machine-checked.** `Communicator` (in
+  `communicator.py`) is a `Protocol` naming the nine members every collective
+  uses. `ProcessGroup` and `SubGroup` both have to satisfy it, so
+  "a subgroup is substitutable for the group it came from" is verified rather
+  than asserted in prose.
+- **Coverage is 93%**, and the number itself was a lesson. The first run
+  reported 24%, because the tests spawn one process per rank and only the
+  parent was instrumented. A number that wrong is worse than none, so the
+  config now enables multiprocessing coverage (150 process files combined).
+
+Three areas came back explicitly clean under review: the device path's
+cross-stream ordering (traced for 1, 2, 3, and N chunks and across ring-step
+boundaries), the pipeline schedules' deadlock freedom (hand-traced under
+rendezvous semantics, where a `send` blocks until its matching `recv` posts),
+and the collective index arithmetic for world sizes 1 through 7.
+
+One gap review found that was not a bug: the pipeline was the only subsystem
+invisible to the flight recorder, so a hung pipeline gave a bare socket timeout
+with no phase information. It now records, on **its own channel** rather than
+the collective-order one, because stages legitimately issue different numbers
+of forwards and backwards and mixing them in would report every healthy
+pipeline as diverged.
 
 ## Running across machines
 
@@ -855,6 +927,7 @@ mini_nccl/
   tensor_parallel.py  # column/row parallel layers, head-split attention
   pipeline.py         # depth-split stages, 1F1B and GPipe schedules
   mesh.py             # sub-group communicators, named parallelism dimensions
+  communicator.py     # the Protocol every collective is written against
   device.py           # pinned staging, copy/network pipeline for GPU tensors
   recorder.py         # flight recorder
   diagnose.py         # desync analysis and Perfetto trace merging

@@ -98,6 +98,82 @@ def test_fsdp_matches_single_process_world4() -> None:
     run(_parity_worker, 4)
 
 
+class DropoutBlock(nn.Module):
+    """A unit containing randomness, which the backward recompute must replay."""
+
+    def __init__(self, width: int = 16) -> None:
+        super().__init__()
+        self.fc = nn.Linear(width, width)
+        self.drop = nn.Dropout(0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.drop(torch.tanh(self.fc(x)))
+
+
+class DropoutModel(nn.Module):
+    def __init__(self, width: int = 16) -> None:
+        super().__init__()
+        torch.manual_seed(0)
+        self.blocks = nn.ModuleList(DropoutBlock(width) for _ in range(2))
+        self.head = nn.Linear(width, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return self.head(x)
+
+
+def _dropout_worker(pg, width: int = 16) -> None:
+    """A sharded unit with dropout must produce the same gradients as no FSDP.
+
+    Because backward recomputes the unit's forward, it has to replay the same
+    random mask. Without rewinding the generator the recompute draws a fresh
+    one, and gradients are then taken against a graph that never produced the
+    loss.
+
+    Note *where* this test looks. The head is downstream of the recomputed
+    units, so its gradient comes from the original forward and stays perfect
+    even when the bug is present; checking it would pass while the sharded
+    weights were off by 0.35. The sharded units' own gradients are the ones
+    that go wrong, so those are what this compares.
+    """
+    model = DropoutModel(width)
+    reference = copy.deepcopy(model)
+    fsdp = FullyShardedDataParallel(model, pg, unit_cls=DropoutBlock)
+    model.train()
+    reference.train()
+
+    x = torch.randn(8, width, generator=torch.Generator().manual_seed(1))
+    y = torch.randn(8, 1, generator=torch.Generator().manual_seed(2))
+
+    # The same seed before each forward, so both draw identical masks.
+    torch.manual_seed(99)
+    fsdp.zero_grad()
+    F.mse_loss(fsdp(x), y).backward()
+    fsdp.sync()
+
+    torch.manual_seed(99)
+    reference.zero_grad()
+    F.mse_loss(reference(x), y).backward()
+
+    for i, unit in enumerate(fsdp.units):
+        block = reference.blocks[i]
+        expected = torch.cat(
+            [block.fc.weight.grad.reshape(-1), block.fc.bias.grad.reshape(-1)]
+        )
+        if pg.world_size > 1:
+            expected = expected / pg.world_size
+        torch.testing.assert_close(
+            unit.shard.grad[: expected.numel()], expected, rtol=1e-5, atol=1e-6,
+            msg=lambda m, i=i: f"unit {i} gradient differs, so the recompute "
+            f"drew a different dropout mask: {m}",
+        )
+
+
+def test_recompute_replays_randomness() -> None:
+    run(_dropout_worker, 1)
+
+
 def _memory_worker(pg) -> dict:
     model = Model(width=64, depth=4)
     fsdp = FullyShardedDataParallel(model, pg, unit_cls=Block)

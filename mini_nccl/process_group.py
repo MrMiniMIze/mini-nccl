@@ -58,7 +58,7 @@ class ProcessGroup:
         self.rank = rank
         self.world_size = world_size
         self.n_channels = n_channels
-        self.op_timeout = op_timeout
+        self.op_timeout: float | None = op_timeout
         self.recorder = Recorder(
             rank,
             world_size,

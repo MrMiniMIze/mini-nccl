@@ -19,3 +19,9 @@ venv/
 # Data & scratch
 data/
 *.tmp
+
+# Coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/

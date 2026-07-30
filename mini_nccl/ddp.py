@@ -47,10 +47,10 @@ import torch
 from torch import nn
 
 from . import collectives
-from .process_group import ProcessGroup
+from .communicator import Communicator
 
 
-def average_gradients(pg: ProcessGroup, params, algorithm: str = "ring") -> int:
+def average_gradients(pg: Communicator, params, algorithm: str = "ring") -> int:
     """Average the gradients of ``params`` across ``pg``. Returns bytes reduced.
 
     The explicit form of what DDP's reducer does implicitly, for the cases where
@@ -114,7 +114,7 @@ class DistributedDataParallel(nn.Module):
     def __init__(
         self,
         module: nn.Module,
-        pg: ProcessGroup,
+        pg: Communicator,
         bucket_cap_mb: float = 1.0,
         overlap: bool = True,
         algorithm: str = "ring",
@@ -161,12 +161,14 @@ class DistributedDataParallel(nn.Module):
                 continue
             nbytes = p.numel() * p.element_size()
             if current and (current_bytes + nbytes > cap_bytes or p.dtype != current_dtype):
+                assert current_dtype is not None  # set whenever current is non-empty
                 self._buckets.append(_Bucket(current, current_dtype))
                 current, current_bytes = [], 0
             current.append(p)
             current_bytes += nbytes
             current_dtype = p.dtype
         if current:
+            assert current_dtype is not None  # set whenever current is non-empty
             self._buckets.append(_Bucket(current, current_dtype))
 
     def _make_hook(self, bucket: _Bucket):

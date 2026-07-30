@@ -42,6 +42,9 @@ _SOCK_BUF_BYTES = 1 << 21
 
 DEFAULT_OP_TIMEOUT = 300.0
 
+# How often the accepter checks whether the rendezvous has been abandoned.
+_ACCEPT_POLL_SECONDS = 0.5
+
 
 def byte_view(tensor: torch.Tensor) -> memoryview:
     """Reinterpret a tensor's storage as a flat, writable uint8 memoryview.
@@ -109,6 +112,7 @@ class Mesh:
         self._partial: dict[tuple[int, int], Connection] = {}
         self._lock = threading.Lock()
         self._op_timeout = op_timeout
+        self._stop = threading.Event()
         if world_size == 1:
             return
 
@@ -120,39 +124,67 @@ class Mesh:
         )
         accepter.start()
 
-        for peer in range(rank):
-            for channel in range(n_channels):
-                self._dial(peer, channel, addrs[peer], timeout)
+        # A failed rendezvous has to clean up after itself. Without this, the
+        # accepter thread stays parked in accept() holding the listening socket,
+        # so a caller that catches RendezvousError and retries in the same
+        # process hits "address already in use" on its own port, and the
+        # connections that did succeed are never closed.
+        try:
+            for peer in range(rank):
+                for channel in range(n_channels):
+                    self._dial(peer, channel, addrs[peer], timeout)
 
-        accepter.join(timeout)
-        expected = (world_size - 1) * n_channels
-        with self._lock:
-            got = len(self._partial)
-            if got != expected:
-                missing = sorted(
-                    {p for p in range(world_size) if p != rank}
-                    - {p for p, _ in self._partial}
-                )
-                raise RendezvousError(
-                    f"rank {rank}: established {got}/{expected} connections; "
-                    f"no contact with ranks {missing}"
-                )
-            for peer in range(world_size):
-                if peer == rank:
-                    continue
-                self.conns[peer] = [self._partial[(peer, c)] for c in range(n_channels)]
-            self._partial.clear()
+            accepter.join(timeout)
+            expected = (world_size - 1) * n_channels
+            with self._lock:
+                got = len(self._partial)
+                if got != expected:
+                    missing = sorted(
+                        {p for p in range(world_size) if p != rank}
+                        - {p for p, _ in self._partial}
+                    )
+                    raise RendezvousError(
+                        f"rank {rank}: established {got}/{expected} connections; "
+                        f"no contact with ranks {missing}"
+                    )
+                for peer in range(world_size):
+                    if peer == rank:
+                        continue
+                    self.conns[peer] = [
+                        self._partial[(peer, c)] for c in range(n_channels)
+                    ]
+                self._partial.clear()
+        except BaseException:
+            self._stop.set()
+            accepter.join(_ACCEPT_POLL_SECONDS * 3)
+            with contextlib.suppress(OSError):
+                listener.close()
+            with self._lock:
+                for conn in self._partial.values():
+                    conn.close()
+                self._partial.clear()
+            raise
 
     def _accept_peers(self, listener: socket.socket, count: int) -> None:
-        for _ in range(count):
-            sock, _ = listener.accept()
-            conn = Connection(sock, self._op_timeout)
-            raw = bytearray(_HANDSHAKE.size)
-            conn.recv_into(memoryview(raw))
-            peer, channel = _HANDSHAKE.unpack(raw)
-            with self._lock:
-                self._partial[(peer, channel)] = conn
-        listener.close()
+        # Polled rather than blocking indefinitely, so an abandoned rendezvous
+        # can tell this thread to stop and release the port.
+        listener.settimeout(_ACCEPT_POLL_SECONDS)
+        try:
+            accepted = 0
+            while accepted < count and not self._stop.is_set():
+                try:
+                    sock, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                conn = Connection(sock, self._op_timeout)
+                raw = bytearray(_HANDSHAKE.size)
+                conn.recv_into(memoryview(raw))
+                peer, channel = _HANDSHAKE.unpack(raw)
+                with self._lock:
+                    self._partial[(peer, channel)] = conn
+                accepted += 1
+        finally:
+            listener.close()
 
     def _dial(self, peer: int, channel: int, addr: tuple[str, int], timeout: float) -> None:
         deadline = time.monotonic() + timeout
@@ -177,6 +209,7 @@ class Mesh:
                 conn.set_timeout(op_timeout)
 
     def close(self) -> None:
+        self._stop.set()
         for channels in self.conns.values():
             for conn in channels:
                 conn.close()

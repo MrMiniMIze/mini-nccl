@@ -49,7 +49,7 @@ from __future__ import annotations
 import torch
 
 from . import collectives
-from .process_group import ProcessGroup
+from .communicator import Communicator
 
 DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024
 
@@ -116,6 +116,7 @@ class Staging:
         no-ops, and it showed up on the first real GPU run.
         """
         if self.accelerated:
+            assert self.stream is not None
             self.stream.wait_stream(torch.cuda.current_stream())
 
     def start_copy_out(self, slot: _Slot, source: torch.Tensor) -> None:
@@ -124,6 +125,7 @@ class Staging:
         if not self.accelerated:
             view.copy_(source)
             return
+        assert self.stream is not None and slot.out_done is not None
         with torch.cuda.stream(self.stream):
             view.copy_(source, non_blocking=True)
         slot.out_done.record(self.stream)
@@ -131,6 +133,7 @@ class Staging:
     def wait_copy_out(self, slot: _Slot) -> None:
         """Block the CPU until this slot's outbound copy has landed."""
         if self.accelerated:
+            assert slot.out_done is not None
             slot.out_done.synchronize()
 
     def start_copy_in(self, slot: _Slot, destination: torch.Tensor) -> None:
@@ -139,6 +142,7 @@ class Staging:
         if not self.accelerated:
             destination.copy_(view)
             return
+        assert self.stream is not None and slot.in_done is not None
         with torch.cuda.stream(self.stream):
             destination.copy_(view, non_blocking=True)
         slot.in_done.record(self.stream)
@@ -147,6 +151,7 @@ class Staging:
     def wait_copy_in(self, slot: _Slot) -> None:
         """Block the CPU until this slot's inbound copy is done reusing it."""
         if self.accelerated and slot.in_flight:
+            assert slot.in_done is not None
             slot.in_done.synchronize()
             slot.in_flight = False
 
@@ -160,12 +165,12 @@ class Staging:
             return
         current = torch.cuda.current_stream()
         for slot in self.slots:
-            if slot.in_flight:
+            if slot.in_flight and slot.in_done is not None:
                 current.wait_event(slot.in_done)
 
 
 def _staged_exchange(
-    pg: ProcessGroup,
+    pg: Communicator,
     send_device: torch.Tensor,
     recv_device: torch.Tensor,
     dst: int,
@@ -207,7 +212,7 @@ def _staged_exchange(
 
 
 def all_reduce_staged(
-    pg: ProcessGroup,
+    pg: Communicator,
     tensor: torch.Tensor,
     op: str = "sum",
     algorithm: str = "auto",
@@ -235,7 +240,7 @@ def all_reduce_staged(
 
 
 def all_reduce_pipelined(
-    pg: ProcessGroup,
+    pg: Communicator,
     tensor: torch.Tensor,
     op: str = "sum",
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,

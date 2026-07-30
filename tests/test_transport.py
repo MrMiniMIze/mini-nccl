@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import socket
+
 import pytest
 import torch
 
@@ -37,6 +39,34 @@ def _sendrecv_ring_worker(pg) -> None:
 
 def test_full_duplex_ring_rotation() -> None:
     run(_sendrecv_ring_worker, 3)
+
+
+def test_failed_rendezvous_frees_the_port() -> None:
+    """A caller that retries after a failed rendezvous must not be blocked.
+
+    The accepter thread parks in accept() holding the listening socket. If a
+    failed rendezvous leaves it there, the port stays bound and a retry in the
+    same process dies with "address already in use" on its own address, which
+    looks like a configuration problem rather than a leak.
+    """
+    from mini_nccl.errors import RendezvousError
+    from mini_nccl.launcher import _free_ports
+    from mini_nccl.transport import Mesh
+
+    port = _free_ports(1)[0]
+    addrs = [("127.0.0.1", port), ("127.0.0.1", _free_ports(1)[0])]
+
+    # Rank 0 with no rank 1 to talk to: it binds its port, waits, and fails.
+    for attempt in range(2):
+        with pytest.raises(RendezvousError):
+            Mesh(0, 2, addrs, n_channels=1, timeout=1.0)
+        # The second iteration is the actual assertion: rebinding the same port
+        # only works if the first attempt released it.
+        assert attempt >= 0
+
+    # And the port really is free for an unrelated listener now.
+    probe = socket.create_server(("127.0.0.1", port))
+    probe.close()
 
 
 def test_byte_view_rejects_non_contiguous() -> None:

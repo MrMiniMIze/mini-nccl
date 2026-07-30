@@ -14,13 +14,15 @@ instead of all ``M``.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mini_nccl.launcher import run
-from mini_nccl.pipeline import PipelineParallel
+from mini_nccl.pipeline import PIPELINE_CHANNEL, PipelineParallel
 
 WIDTH = 8
 LAYERS_PER_STAGE = 2
@@ -149,6 +151,52 @@ def test_gpipe_holds_every_microbatch() -> None:
     reports = run(_depth_worker, world, "gpipe", n_micro)
     for report in reports:
         assert report["peak"] == n_micro, report
+
+
+def _traced_worker(pg) -> None:
+    stage = nn.Sequential(nn.Linear(WIDTH, WIDTH), nn.Tanh())
+    pipeline = PipelineParallel(stage, pg, (2, WIDTH), loss_fn=F.mse_loss)
+    for _ in range(2):
+        for param in stage.parameters():
+            param.grad = None
+        pipeline.step(
+            inputs=torch.randn(8, WIDTH) if pg.rank == 0 else None,
+            targets=torch.randn(8, WIDTH) if pg.rank == pg.world_size - 1 else None,
+            n_microbatches=4,
+        )
+
+
+def test_pipeline_is_traced_without_faking_a_desync(tmp_path) -> None:
+    """Pipeline events must be visible, and on a channel of their own.
+
+    Stages legitimately issue different numbers of forwards and backwards, since
+    warmup depends on the stage index. Recording them on the collective-order
+    channel would therefore make every healthy pipeline look diverged, so they
+    get their own channel and desync detection ignores them.
+    """
+    import subprocess
+    import sys
+
+    trace_dir = tmp_path / "trace"
+    run(_traced_worker, 4, trace_dir=trace_dir, timeout=180.0)
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "mini_nccl.diagnose", str(trace_dir)],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"a healthy pipeline was reported as broken:\n{proc.stdout}"
+    assert "all ranks agree" in proc.stdout, proc.stdout
+    # Present in the trace, under its own label.
+    assert "'pipeline':" in proc.stdout, proc.stdout
+
+    state = json.loads((trace_dir / "rank0.json").read_text(encoding="utf-8"))
+    ops = [ev["op"] for ev in state["events"]]
+    assert "pp_forward" in ops and "pp_backward" in ops, ops
+    assert all(
+        ev["channel"] == PIPELINE_CHANNEL
+        for ev in state["events"]
+        if ev["op"].startswith("pp_")
+    )
 
 
 def _rejects_worker(pg) -> None:

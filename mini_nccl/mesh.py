@@ -45,6 +45,7 @@ from collections.abc import Callable, Sequence
 
 import torch
 
+from .communicator import Communicator
 from .process_group import ProcessGroup
 
 
@@ -53,7 +54,7 @@ class SubGroup:
 
     def __init__(
         self,
-        parent: ProcessGroup | SubGroup,
+        parent: Communicator,
         global_ranks: Sequence[int],
         name: str = "",
     ) -> None:
@@ -72,7 +73,6 @@ class SubGroup:
         self.world_size = len(ranks)
         self.n_channels = parent.n_channels
         self.recorder = parent.recorder
-        self.op_timeout = parent.op_timeout
 
     def _global(self, local_rank: int) -> int:
         return self.global_ranks[local_rank]
@@ -120,9 +120,15 @@ class SubGroup:
     def run_per_channel(self, fns: list[Callable[[], None]]) -> None:
         self.parent.run_per_channel(fns)
 
-    def subgroup(self, global_ranks: Sequence[int], name: str = "") -> SubGroup:
-        """Nest another subgroup, still resolving against the same sockets."""
-        return SubGroup(self, global_ranks, name)
+    def subgroup(self, ranks: Sequence[int], name: str = "") -> SubGroup:
+        """Nest another subgroup, still resolving against the same sockets.
+
+        ``ranks`` are in *this* group's numbering, not the root group's, since
+        that is what the nested group resolves against. For a subgroup carved
+        straight out of the root process group the two coincide, which is why
+        :meth:`ParallelMesh.group` can pass true global ranks.
+        """
+        return SubGroup(self, ranks, name)
 
     def __repr__(self) -> str:
         label = f" {self.name!r}" if self.name else ""
@@ -176,7 +182,7 @@ class ParallelMesh:
         base = self.pg.rank - self.coords[name] * self.strides[name]
         return [base + i * self.strides[name] for i in range(self.dims[name])]
 
-    def group(self, name: str) -> SubGroup | ProcessGroup:
+    def group(self, name: str) -> SubGroup:
         """This rank's communicator along dimension ``name``.
 
         A dimension of size 1 returns a single-rank subgroup, so callers do not

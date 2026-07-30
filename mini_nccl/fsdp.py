@@ -48,12 +48,14 @@ shape of a transformer block.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import torch
 from torch import nn
 
 from . import collectives
+from .communicator import Communicator
 from .ddp import average_gradients
-from .process_group import ProcessGroup
 
 _RELEASED = torch.empty(0)
 
@@ -61,7 +63,7 @@ _RELEASED = torch.empty(0)
 class _Unit:
     """One module whose parameters are sharded across ranks."""
 
-    def __init__(self, module: nn.Module, pg: ProcessGroup, name: str) -> None:
+    def __init__(self, module: nn.Module, pg: Communicator, name: str) -> None:
         self.module = module
         self.pg = pg
         self.name = name
@@ -116,7 +118,9 @@ class _Unit:
             flat = torch.cat(collectives.all_gather(self.pg, shard.detach()))
         offset = 0
         for (sub, attr, shape, numel) in self.entries:
-            sub._parameters[attr].data = flat[offset : offset + numel].view(shape)
+            param = sub._parameters[attr]
+            assert param is not None  # recorded from named_parameters, so present
+            param.data = flat[offset : offset + numel].view(shape)
             offset += numel
         if self.owner is not None:
             self.owner._note_materialized(self.full_bytes)
@@ -125,7 +129,9 @@ class _Unit:
     def release(self) -> None:
         """Drop the full parameters, keeping only this rank's shard."""
         for (sub, attr, _, _) in self.entries:
-            sub._parameters[attr].data = _RELEASED
+            param = sub._parameters[attr]
+            assert param is not None  # recorded from named_parameters, so present
+            param.data = _RELEASED
         if self.owner is not None:
             self.owner._note_released(self.full_bytes)
 
@@ -151,12 +157,27 @@ class _Unit:
 
 
 class _ShardedForward(torch.autograd.Function):
-    """Runs a unit's forward with its parameters gathered only transiently."""
+    """Runs a unit's forward with its parameters gathered only transiently.
+
+    Because backward recomputes the forward, the recompute has to reproduce it
+    *exactly*, which means restoring the random number generator state. A unit
+    containing dropout would otherwise draw a different mask the second time,
+    and the gradients would be taken with respect to a graph that never
+    produced the loss. The failure is silent and, worse, selectively invisible:
+    layers downstream of the unit still get perfect gradients, so a smoke test
+    that checks the head looks fine while the sharded weights are badly wrong.
+    ``torch.utils.checkpoint`` handles this the same way and for the same
+    reason.
+    """
 
     @staticmethod
     def forward(ctx, unit: _Unit, shard: torch.Tensor, x: torch.Tensor):
         ctx.unit = unit
         ctx.save_for_backward(x, shard)
+        ctx.cpu_rng_state = torch.get_rng_state()
+        ctx.cuda_device = x.device if x.device.type == "cuda" else None
+        if ctx.cuda_device is not None:
+            ctx.cuda_rng_state = torch.cuda.get_rng_state(ctx.cuda_device)
         with torch.no_grad():
             unit.materialize(shard)
             try:
@@ -173,10 +194,18 @@ class _ShardedForward(torch.autograd.Function):
         unit.materialize(shard)
         try:
             # Recompute this unit's forward, this time building a graph, so
-            # gradients can be taken without having kept anything alive.
+            # gradients can be taken without having kept anything alive. The
+            # generator state is rewound first so that any randomness inside
+            # the unit replays identically, and fork_rng puts the outer stream
+            # back afterwards so the caller's sequence is undisturbed.
+            devices = [] if ctx.cuda_device is None else [ctx.cuda_device]
             x_local = x.detach().requires_grad_(True)
-            with torch.enable_grad():
-                y = unit.module(x_local)
+            with torch.random.fork_rng(devices=devices, enabled=True):
+                torch.set_rng_state(ctx.cpu_rng_state)
+                if ctx.cuda_device is not None:
+                    torch.cuda.set_rng_state(ctx.cuda_rng_state, ctx.cuda_device)
+                with torch.enable_grad():
+                    y = unit.module(x_local)
             grads = torch.autograd.grad(
                 y, [x_local, *unit.params], grad_outputs=grad_y, allow_unused=True
             )
@@ -205,7 +234,7 @@ class FullyShardedDataParallel(nn.Module):
     def __init__(
         self,
         module: nn.Module,
-        pg: ProcessGroup,
+        pg: Communicator,
         unit_cls: type | tuple[type, ...] | None = None,
         units: list[nn.Module] | None = None,
     ) -> None:
@@ -234,6 +263,8 @@ class FullyShardedDataParallel(nn.Module):
         targets = {id(m) for m in (units or [])}
         for parent in list(module.modules()):
             for key, child in list(parent._modules.items()):
+                if child is None:
+                    continue  # a registered-but-unset submodule slot
                 selected = id(child) in targets or (
                     unit_cls is not None and isinstance(child, unit_cls)
                 )
@@ -271,7 +302,14 @@ class FullyShardedDataParallel(nn.Module):
         """
         return iter(self.shard_parameters() + self._replicated)
 
-    def named_parameters(self, prefix: str = "", recurse: bool = True):
+    def named_parameters(
+        self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
+    ) -> Iterator[tuple[str, nn.Parameter]]:
+        """Matches the base signature, so anything in torch that calls it works.
+
+        ``recurse`` and ``remove_duplicate`` are accepted and ignored: the list
+        this returns is already flat and already deduplicated.
+        """
         for unit in self.units:
             yield f"{prefix}{unit.name}.shard", unit.shard
         for param in self._replicated:
@@ -343,9 +381,9 @@ class FullyShardedDataParallel(nn.Module):
                 state[name] = flat[offset : offset + numel].view(shape).clone()
                 offset += numel
         for param in self._replicated:
-            name = self._param_names.get(id(param))
-            if name is not None:
-                state[name] = param.detach().clone()
+            param_name = self._param_names.get(id(param))
+            if param_name is not None:
+                state[param_name] = param.detach().clone()
         for name, buffer in self.module.named_buffers():
             state[name] = buffer.detach().clone()
         return state

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mini-nccl"
-version = "0.6.0"
+version = "0.7.0"
 description = "A from-scratch collective communications library (ring, tree, and halving-doubling all-reduce over raw TCP) with all four parallelism strategies built on top of it: data parallel, fully sharded, tensor parallel, and pipeline"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -44,3 +44,19 @@ ignore = [
 # Tests reach into internals deliberately, and benchmarks print tables.
 "tests/*" = ["E501"]
 "benchmarks/*" = ["E501"]
+
+[tool.coverage.run]
+source = ["mini_nccl"]
+parallel = true
+# The tests spawn one process per rank, so without multiprocessing awareness
+# coverage only sees the parent and reports a number that is badly wrong
+# (24% against a real 90%+).
+concurrency = ["multiprocessing", "thread"]
+sigterm = true
+
+[tool.coverage.report]
+exclude_also = [
+    'if TYPE_CHECKING:',
+    'raise NotImplementedError',
+    '^\s*\.\.\.$',
+]

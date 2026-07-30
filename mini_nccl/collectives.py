@@ -33,11 +33,12 @@ Two optimizations apply to the bandwidth-bound path:
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from functools import partial
 
 import torch
 
-from .process_group import ProcessGroup
+from .communicator import Communicator
 
 # Crossover point between latency-bound and bandwidth-bound messages.
 # Measured on loopback TCP: at 1 MiB tree and ring tie at both world sizes
@@ -63,7 +64,8 @@ MAX_SLICES = int(os.environ.get("MINI_NCCL_MAX_SLICES", "1"))
 #: Selectable all-reduce algorithms, in the order benchmarks report them.
 ALGORITHMS = ("ring", "tree", "halving", "naive")
 
-_OPS = {
+#: Reduction ops, as in-place accumulate(acc, other).
+_OPS: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
     "sum": lambda acc, other: acc.add_(other),
     "prod": lambda acc, other: acc.mul_(other),
     "max": lambda acc, other: torch.maximum(acc, other, out=acc),
@@ -82,7 +84,7 @@ def _check_op(op: str) -> None:
         raise ValueError(f"unknown op {op!r}; expected one of {sorted(_OPS)}")
 
 
-def _n_channels_for(pg: ProcessGroup, nbytes: int) -> int:
+def _n_channels_for(pg: Communicator, nbytes: int) -> int:
     """Channel count, derived only from sizes so every rank agrees."""
     return max(1, min(pg.n_channels, nbytes // CHANNEL_MIN_BYTES))
 
@@ -108,7 +110,7 @@ LOW_PRECISION = (torch.bfloat16, torch.float16)
 
 
 def all_reduce(
-    pg: ProcessGroup,
+    pg: Communicator,
     tensor: torch.Tensor,
     op: str = "sum",
     algorithm: str = "auto",
@@ -200,7 +202,7 @@ def all_reduce(
 
 
 def _ring_on_channel(
-    pg: ProcessGroup,
+    pg: Communicator,
     segment: torch.Tensor,
     op: str,
     channel: int,
@@ -231,10 +233,14 @@ def _ring_on_channel(
         right, left = (r + 1) % W, (r - 1) % W
         reduce_op = _OPS[op]
         n_slices = _n_slices_for(chunk * flat.element_size())
-        send_wire = recv_wire = None
+        # Bound as a pair so that inside the narrow-wire branch below both
+        # buffers are known to exist, rather than being separately optional.
+        wire: tuple[torch.Tensor, torch.Tensor] | None = None
         if wire_dtype is not None:
-            send_wire = torch.empty(chunk, dtype=wire_dtype)
-            recv_wire = torch.empty(chunk, dtype=wire_dtype)
+            wire = (
+                torch.empty(chunk, dtype=wire_dtype),
+                torch.empty(chunk, dtype=wire_dtype),
+            )
 
         # Phase 1 (reduce-scatter): after W-1 steps, this rank holds the
         # fully reduced block (r + 1) % W. Each step forwards the block we
@@ -244,17 +250,16 @@ def _ring_on_channel(
             send_idx = (r - step) % W
             recv_idx = (r - step - 1) % W
             target = blocks[recv_idx]
-            if wire_dtype is None:
+            if wire is None:
+
+                def accumulate(start: int, end: int, t=target) -> None:
+                    reduce_op(t[start:end], tmp[start:end])
+
                 pg.send_recv_sliced(
-                    blocks[send_idx],
-                    right,
-                    tmp,
-                    left,
-                    n_slices,
-                    lambda start, end, t=target: reduce_op(t[start:end], tmp[start:end]),
-                    channel,
+                    blocks[send_idx], right, tmp, left, n_slices, accumulate, channel
                 )
             else:
+                send_wire, recv_wire = wire
                 send_wire.copy_(blocks[send_idx])
                 pg.send_recv(send_wire, right, recv_wire, left, channel)
                 if op == "sum":
@@ -270,9 +275,10 @@ def _ring_on_channel(
         for step in range(W - 1):
             send_idx = (r + 1 - step) % W
             recv_idx = (r - step) % W
-            if wire_dtype is None:
+            if wire is None:
                 pg.send_recv(blocks[send_idx], right, blocks[recv_idx], left, channel)
             else:
+                send_wire, recv_wire = wire
                 send_wire.copy_(blocks[send_idx])
                 pg.send_recv(send_wire, right, recv_wire, left, channel)
                 blocks[recv_idx].copy_(recv_wire)
@@ -283,7 +289,7 @@ def _ring_on_channel(
         pg.recorder.finish(ev)
 
 
-def _halving_doubling(pg: ProcessGroup, tensor: torch.Tensor, op: str) -> None:
+def _halving_doubling(pg: Communicator, tensor: torch.Tensor, op: str) -> None:
     """Recursive halving reduce-scatter, then recursive doubling all-gather.
 
     Rank ``r`` ends the halving phase owning segment ``r`` of the reduced
@@ -312,13 +318,17 @@ def _halving_doubling(pg: ProcessGroup, tensor: torch.Tensor, op: str) -> None:
         else:
             send_view, keep = padded[mid:hi], padded[lo:mid]
         recv_view = tmp[: keep.numel()]
+
+        def accumulate(start: int, end: int, k=keep, rv=recv_view) -> None:
+            reduce_op(k[start:end], rv[start:end])
+
         pg.send_recv_sliced(
             send_view,
             partner,
             recv_view,
             partner,
             _n_slices_for(keep.numel() * flat.element_size()),
-            lambda start, end, k=keep, rv=recv_view: reduce_op(k[start:end], rv[start:end]),
+            accumulate,
         )
         lo, hi = (mid, hi) if r & mask else (lo, mid)
         mask >>= 1
@@ -340,7 +350,7 @@ def _halving_doubling(pg: ProcessGroup, tensor: torch.Tensor, op: str) -> None:
 
 
 def _binomial_reduce(
-    pg: ProcessGroup,
+    pg: Communicator,
     tensor: torch.Tensor,
     op: str,
     root: int,
@@ -386,7 +396,7 @@ def _binomial_reduce(
 
 
 def _binomial_broadcast(
-    pg: ProcessGroup,
+    pg: Communicator,
     tensor: torch.Tensor,
     root: int,
     wire_dtype: torch.dtype | None = None,
@@ -417,7 +427,7 @@ def _binomial_broadcast(
         mask >>= 1
 
 
-def _naive_all_reduce(pg: ProcessGroup, tensor: torch.Tensor, op: str) -> None:
+def _naive_all_reduce(pg: Communicator, tensor: torch.Tensor, op: str) -> None:
     W, r = pg.world_size, pg.rank
     flat = _flat(tensor)
     reduce_op = _OPS[op]
@@ -433,7 +443,7 @@ def _naive_all_reduce(pg: ProcessGroup, tensor: torch.Tensor, op: str) -> None:
         pg.recv(tensor, 0)
 
 
-def broadcast(pg: ProcessGroup, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+def broadcast(pg: Communicator, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
     """Broadcast ``tensor`` from rank ``src`` to all ranks, in place."""
     if pg.world_size == 1:
         return tensor
@@ -446,7 +456,7 @@ def broadcast(pg: ProcessGroup, tensor: torch.Tensor, src: int = 0) -> torch.Ten
     return tensor
 
 
-def all_gather(pg: ProcessGroup, tensor: torch.Tensor) -> list[torch.Tensor]:
+def all_gather(pg: Communicator, tensor: torch.Tensor) -> list[torch.Tensor]:
     """Gather equal-shaped tensors from every rank, via a ring.
 
     Returns a list of ``world_size`` tensors, indexed by rank.
@@ -471,7 +481,7 @@ def all_gather(pg: ProcessGroup, tensor: torch.Tensor) -> list[torch.Tensor]:
     return [out[i].view(tensor.shape).clone() for i in range(W)]
 
 
-def reduce_scatter(pg: ProcessGroup, tensor: torch.Tensor, op: str = "sum") -> torch.Tensor:
+def reduce_scatter(pg: Communicator, tensor: torch.Tensor, op: str = "sum") -> torch.Tensor:
     """Reduce across ranks and return this rank's 1/W-th of the result.
 
     ``tensor.numel()`` must be divisible by ``world_size`` (NCCL contract).
@@ -505,7 +515,7 @@ def reduce_scatter(pg: ProcessGroup, tensor: torch.Tensor, op: str = "sum") -> t
     return blocks[r].clone()
 
 
-def all_to_all(pg: ProcessGroup, tensor: torch.Tensor) -> torch.Tensor:
+def all_to_all(pg: Communicator, tensor: torch.Tensor) -> torch.Tensor:
     """Transpose data across ranks: rank ``i`` receives chunk ``i`` from everyone.
 
     ``tensor`` is treated as ``world_size`` equal chunks; chunk ``j`` is sent
@@ -539,7 +549,7 @@ def all_to_all(pg: ProcessGroup, tensor: torch.Tensor) -> torch.Tensor:
     return out.view(tensor.shape)
 
 
-def barrier(pg: ProcessGroup) -> None:
+def barrier(pg: Communicator) -> None:
     """Block until every rank has entered the barrier."""
     if pg.world_size == 1:
         return

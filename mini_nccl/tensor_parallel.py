@@ -47,7 +47,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from . import collectives
-from .process_group import ProcessGroup
+from .communicator import Communicator
 
 
 class _IdentityToAllReduce(torch.autograd.Function):
@@ -58,13 +58,13 @@ class _IdentityToAllReduce(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, pg: ProcessGroup, x: torch.Tensor):
+    def forward(ctx, pg: Communicator, x: torch.Tensor):
         ctx.pg = pg
         return x
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
-        pg: ProcessGroup = ctx.pg
+        pg: Communicator = ctx.pg
         if pg.world_size > 1:
             grad = grad.contiguous()
             collectives.all_reduce(pg, grad)
@@ -80,7 +80,7 @@ class _AllReduceToIdentity(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, pg: ProcessGroup, x: torch.Tensor):
+    def forward(ctx, pg: Communicator, x: torch.Tensor):
         if pg.world_size > 1:
             x = x.contiguous()
             collectives.all_reduce(pg, x)
@@ -95,7 +95,7 @@ class _GatherFromRanks(torch.autograd.Function):
     """Concatenate feature shards in forward, slice the gradient in backward."""
 
     @staticmethod
-    def forward(ctx, pg: ProcessGroup, x: torch.Tensor):
+    def forward(ctx, pg: Communicator, x: torch.Tensor):
         ctx.pg = pg
         ctx.width = x.shape[-1]
         if pg.world_size == 1:
@@ -104,7 +104,7 @@ class _GatherFromRanks(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
-        pg: ProcessGroup = ctx.pg
+        pg: Communicator = ctx.pg
         if pg.world_size == 1:
             return None, grad
         start = pg.rank * ctx.width
@@ -135,7 +135,7 @@ class ColumnParallelLinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        pg: ProcessGroup,
+        pg: Communicator,
         bias: bool = True,
         gather_output: bool = False,
         shard_rows: torch.Tensor | None = None,
@@ -192,7 +192,7 @@ class RowParallelLinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        pg: ProcessGroup,
+        pg: Communicator,
         bias: bool = True,
         input_is_sharded: bool = True,
     ) -> None:
@@ -234,7 +234,7 @@ class ParallelMLP(nn.Module):
     is produced to the moment it is consumed.
     """
 
-    def __init__(self, width: int, pg: ProcessGroup, expansion: int = 4) -> None:
+    def __init__(self, width: int, pg: Communicator, expansion: int = 4) -> None:
         super().__init__()
         self.up = ColumnParallelLinear(width, expansion * width, pg)
         self.down = RowParallelLinear(expansion * width, width, pg)
@@ -243,7 +243,7 @@ class ParallelMLP(nn.Module):
         return self.down(F.gelu(self.up(x)))
 
 
-def _qkv_shard_rows(width: int, n_head: int, head_dim: int, pg: ProcessGroup) -> torch.Tensor:
+def _qkv_shard_rows(width: int, n_head: int, head_dim: int, pg: Communicator) -> torch.Tensor:
     """Rows of a fused QKV weight belonging to this rank.
 
     The fused weight is laid out ``[q(width) | k(width) | v(width)]`` and each
@@ -271,7 +271,7 @@ class ParallelSelfAttention(nn.Module):
     end and the single all-reduce at the output combines them.
     """
 
-    def __init__(self, width: int, n_head: int, pg: ProcessGroup) -> None:
+    def __init__(self, width: int, n_head: int, pg: Communicator) -> None:
         super().__init__()
         if n_head % pg.world_size:
             raise ValueError(f"n_head={n_head} must be divisible by world_size={pg.world_size}")

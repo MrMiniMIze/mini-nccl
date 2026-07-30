@@ -26,7 +26,7 @@ import json
 import statistics
 from pathlib import Path
 
-CHANNEL_LABEL = {-1: "collective order"}
+CHANNEL_LABEL = {-1: "collective order", -2: "pipeline"}
 
 
 def load(directory: Path) -> list[dict]:

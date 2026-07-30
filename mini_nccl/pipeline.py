@@ -54,16 +54,23 @@ from collections import deque
 import torch
 from torch import nn
 
-from .process_group import ProcessGroup
+from .communicator import Communicator
 
 SCHEDULES = ("1f1b", "gpipe")
+
+#: Pipeline events are recorded on their own channel rather than the
+#: collective-order channel. Stages legitimately issue different numbers of
+#: forwards and backwards (warmup depends on the stage index), so mixing them
+#: into the stream that desync detection compares would report every healthy
+#: pipeline as diverged.
+PIPELINE_CHANNEL = -2
 
 
 class PipelineParallel:
     def __init__(
         self,
         stage: nn.Module,
-        pg: ProcessGroup,
+        pg: Communicator,
         activation_shape: tuple[int, ...],
         loss_fn=None,
         schedule: str = "1f1b",
@@ -86,6 +93,11 @@ class PipelineParallel:
         self.is_last = self.rank == self.n_stages - 1
         self.prev = self.rank - 1
         self.next = self.rank + 1
+
+        elements = 1
+        for dim in self.activation_shape:
+            elements *= dim
+        self._activation_bytes = elements * torch.empty(0, dtype=dtype).element_size()
 
         # (input leaf, output) per microbatch awaiting its backward, in order.
         self._queue: deque[tuple[torch.Tensor | None, torch.Tensor]] = deque()
@@ -131,6 +143,20 @@ class PipelineParallel:
 
     def _forward(self, micro_input: torch.Tensor | None, micro_target, n_micro: int):
         """Run this stage's forward for one microbatch and queue it for backward."""
+        ev = self.pg.recorder.start(
+            "pp_forward",
+            self.schedule,
+            channel=PIPELINE_CHANNEL,
+            nbytes=self._activation_bytes,
+            stage=self.rank,
+            depth=len(self._queue),
+        )
+        try:
+            return self._forward_inner(micro_input, micro_target, n_micro)
+        finally:
+            self.pg.recorder.finish(ev)
+
+    def _forward_inner(self, micro_input: torch.Tensor | None, micro_target, n_micro: int):
         if self.is_first:
             x = None
             activation_in = micro_input
@@ -148,6 +174,20 @@ class PipelineParallel:
         return out
 
     def _backward(self, grad: torch.Tensor | None) -> None:
+        ev = self.pg.recorder.start(
+            "pp_backward",
+            self.schedule,
+            channel=PIPELINE_CHANNEL,
+            nbytes=self._activation_bytes,
+            stage=self.rank,
+            depth=len(self._queue),
+        )
+        try:
+            self._backward_inner(grad)
+        finally:
+            self.pg.recorder.finish(ev)
+
+    def _backward_inner(self, grad: torch.Tensor | None) -> None:
         """Run backward for the oldest queued microbatch.
 
         ``grad`` is the gradient of that microbatch's output, already received
@@ -165,6 +205,9 @@ class PipelineParallel:
         else:
             out.backward(grad)
         if not self.is_first:
+            # Only the first stage queues a None input; every other stage
+            # received a leaf, so backward has just populated its gradient.
+            assert x is not None and x.grad is not None
             self._send_gradient(x.grad)
 
     # ---- schedules --------------------------------------------------------
@@ -196,14 +239,15 @@ class PipelineParallel:
                     f"n_microbatches={n_microbatches}"
                 )
 
-        micro_inputs = (
+        # Both were checked above for the stages that need them.
+        micro_inputs: list[torch.Tensor | None] = (
             list(torch.chunk(inputs, n_microbatches))
-            if self.is_first
+            if self.is_first and inputs is not None
             else [None] * n_microbatches
         )
-        micro_targets = (
+        micro_targets: list[torch.Tensor | None] = (
             list(torch.chunk(targets, n_microbatches))
-            if self.is_last
+            if self.is_last and targets is not None
             else [None] * n_microbatches
         )
 
