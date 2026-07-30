@@ -47,6 +47,7 @@ bandwidth ratio explains all four negative results at once.
 | Launcher | `mini_nccl/launcher.py` | `mn.run(fn, world_size)`: spawn, rendezvous, collect results, notice dead ranks |
 | Examples | `examples/` | Char-level GPT under DDP, FSDP, tensor, pipeline, 2D and 3D meshes, plus a diagnosed hang |
 | Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit, low-precision study, PCIe copy-ceiling analysis |
+| Mutation check | `scripts/mutation_check.py` | Breaks the library on purpose to verify the tests would notice; runs in CI |
 
 Every layer is built on the one below it, and nothing reaches past its
 neighbour:
@@ -85,8 +86,9 @@ flowchart TB
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 70 tests, world sizes 1-8
+pytest -q                                        # 71 tests, world sizes 1-8
 mypy mini_nccl --ignore-missing-imports          # clean across 15 modules
+python scripts/mutation_check.py                 # do the tests have teeth?
 
 python examples/train_gpt.py --world-size 4 --steps 200 --sample
 python examples/train_gpt.py --world-size 4 --steps 200 --fsdp   # sharded
@@ -745,7 +747,7 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q     # 70 tests, ~10 min (process spawn dominates)
+pytest -q     # 71 tests, ~10 min (process spawn dominates)
 
 # Coverage needs multiprocessing awareness or it only sees the parent process
 # and reports about 24% against a real 93%.
@@ -856,6 +858,53 @@ boundaries), the pipeline schedules' deadlock freedom (hand-traced under
 rendezvous semantics, where a `send` blocks until its matching `recv` posts),
 and the collective index arithmetic for world sizes 1 through 7.
 
+### Do the tests have teeth?
+
+A passing suite proves the code works on the cases it covers. It says nothing
+about whether the tests would *fail* if the code were wrong, and those are
+different properties. Since I had already found two of my own tests to be
+vacuous this project, that question needed an answer rather than an assumption.
+
+`scripts/mutation_check.py` breaks the library on purpose, one edit at a time,
+and checks the suite notices. Every mutation is a mistake a person could make.
+It runs in CI, and 13 of 14 real mutations are caught:
+
+| mutation | what it breaks | caught by |
+|---|---|---|
+| `ring-send-index` | off-by-one in the ring reduce-scatter schedule | `test_collective_battery` |
+| `ring-skip-allgather` | one too few all-gather steps | `test_collective_battery` |
+| `halving-swap-halves` | halving-doubling keeps the half it should have sent | `test_collective_battery` |
+| `ddp-no-average` | DDP sums gradients instead of averaging them | `test_ddp_matches_single_process` |
+| `ddp-no-overlap-dispatch` | the reducer is never dispatched during backward | `test_overlap.py` |
+| `fsdp-rng` | the recompute draws a different dropout mask (a shipped bug) | `test_recompute_replays_randomness` |
+| `fsdp-no-grad-scale` | reduce-scatter without averaging | `test_fsdp_matches_single_process` |
+| `tp-no-backward-allreduce` | column-parallel skips its backward all-reduce | `test_parallel_mlp_matches_reference_world2` |
+| `pipeline-lifo-queue` | gradients matched to the newest microbatch, not the oldest | `test_1f1b_matches_single_process_four_stages` |
+| `mesh-transposed-strides` | mesh dimensions laid out in the wrong order | `test_mesh_layout_puts_neighbours...` |
+| `subgroup-no-translation` | a subgroup talks to global ranks instead of its members | `test_collectives_run_unchanged_on_a_subgroup` |
+| `recorder-frozen-seq` | every collective records sequence 0, breaking desync detection | `test_desync_times_out_with_diagnosis` |
+| `launcher-swallow-errors` | worker failures discarded, so every test would pass regardless | `test_dead_rank_fails_fast` |
+| `device-stream-order` | the copy stream stops waiting for the reduction (a shipped bug) | `test_every_exchange_orders_the_copy_stream` |
+
+One mutation is a deliberate no-op that is *expected* to survive, because a
+checker that never reports a survivor cannot be trusted when it says everything
+is caught.
+
+**And it immediately earned its keep.** `device-stream-order` reproduces the
+cross-stream bug this project shipped, and on the first run it was caught. On the
+second run it **survived**: the 12 device tests passed with the dependency
+removed. A race is only sometimes wrong. I went looking for a payload that would
+expose it reliably and could not find one, at sizes from 4 KiB to 30 MiB, three
+attempts each, all clean. The bug that had originally appeared within seconds had
+become unreproducible.
+
+A test that catches a race only when the timing cooperates is not a regression
+test. So the fix was to stop testing the symptom and test the mechanism: assert
+that every exchange *expresses* the cross-stream dependency, which is
+deterministic, and leave the timing to the hardware. That mutation is now caught
+3 out of 3. It is the same lesson as the DDP overlap test asserting dispatch
+rather than scheduling, arrived at twice from opposite directions.
+
 One gap review found that was not a bug: the pipeline was the only subsystem
 invisible to the flight recorder, so a hung pipeline gave a bare socket timeout
 with no phase information. It now records, on **its own channel** rather than
@@ -934,6 +983,7 @@ mini_nccl/
   launcher.py         # local multi-process runner
 tests/                # collectives, DDP/FSDP/TP/PP parity, faults, precision
 benchmarks/           # sweep, tuning ablation, cost model, precision study
+scripts/              # mutation checker, multi-node launcher
 examples/             # char-GPT (DDP, FSDP, tensor, pipeline, 2D, 3D), demos
 docs/multinode.md     # running on real hardware
 docs/cuda.md          # the device path, and how to enable it

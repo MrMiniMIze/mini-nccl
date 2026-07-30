@@ -20,6 +20,23 @@ jobs:
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: mypy mini_nccl --ignore-missing-imports
 
+  # Checks that the tests would fail if the library broke. --strict also fails
+  # if a mutation can no longer be applied, so the checker cannot quietly rot
+  # as the code it points at moves.
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install torch (CPU) and package
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .[dev]
+      - run: python scripts/mutation_check.py --strict
+
   test:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25

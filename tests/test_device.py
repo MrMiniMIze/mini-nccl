@@ -164,6 +164,52 @@ def test_cuda_tensors_all_reduce() -> None:
     run(_cuda_worker, 2)
 
 
+def _stream_dependency_worker(pg) -> None:
+    """Every exchange must order the copy stream behind the compute stream.
+
+    This is deliberately a white-box check on the mechanism rather than on the
+    symptom, and the reason is worth recording. Removing that dependency
+    introduces a race, and a race is only *sometimes* wrong: the mutation
+    checker (`scripts/mutation_check.py`) removed the `wait_stream` call and the
+    behavioural device tests still passed 12/12, at payloads from 4 KiB to
+    30 MiB, three attempts each. The bug that originally showed up within
+    seconds had become unreproducible.
+
+    A test that catches a race only when the timing cooperates is not a
+    regression test. So this asserts the dependency is *expressed*, which is
+    deterministic, and leaves the timing to the hardware. Same reasoning as the
+    DDP overlap test asserting dispatch rather than scheduling.
+    """
+    original = torch.cuda.Stream.wait_stream
+    calls: list[int] = []
+
+    def counting_wait_stream(self, other):
+        calls.append(1)
+        return original(self, other)
+
+    torch.cuda.Stream.wait_stream = counting_wait_stream
+    try:
+        x = _contribution(pg.rank, 65_536).to("cuda")
+        all_reduce_pipelined(pg, x, chunk_bytes=1 << 16)
+    finally:
+        torch.cuda.Stream.wait_stream = original
+
+    # A ring does 2(W-1) exchanges, and each one has to order the copy stream
+    # behind whatever the compute stream still owes.
+    expected = 2 * (pg.world_size - 1)
+    assert len(calls) >= expected, (
+        f"the copy stream was ordered behind the compute stream {len(calls)} "
+        f"times, expected at least {expected}: a cross-stream dependency is "
+        f"missing and the reduction can be read before it lands"
+    )
+    torch.testing.assert_close(x.cpu(), _expected(pg.world_size, 65_536))
+
+
+@requires_cuda
+def test_every_exchange_orders_the_copy_stream() -> None:
+    run(_stream_dependency_worker, 2)
+
+
 def _cuda_staging_worker(pg) -> None:
     """Pinned staging and the copy stream must actually be in use."""
     staging = Staging(1 << 14, torch.float32, torch.device("cuda"), chunk_bytes=1 << 12)
