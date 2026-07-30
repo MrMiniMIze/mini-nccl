@@ -190,6 +190,45 @@ MUTATIONS: list[Mutation] = [
         requires="cuda",
     ),
     Mutation(
+        name="transport-partial-recv",
+        file="mini_nccl/transport.py",
+        old="        while remaining:",
+        new="        if remaining:",
+        breaks="a receive stops looping, so any message larger than one TCP "
+        "segment is silently truncated",
+        tests=["tests/test_collectives.py::test_collective_battery"],
+    ),
+    Mutation(
+        name="transport-handshake-identity",
+        file="mini_nccl/transport.py",
+        old="        conn.send(memoryview(_HANDSHAKE.pack(self.rank, channel)))",
+        new="        conn.send(memoryview(_HANDSHAKE.pack(0, channel)))",
+        breaks="every dialing rank claims to be rank 0, so connections are "
+        "filed against the wrong peers",
+        tests=["tests/test_collectives.py::test_collective_battery"],
+    ),
+    # The diagnostic tooling needs its own mutations: it is the part of the
+    # project whose whole job is to be right when everything else is wrong, and
+    # a broken diagnosis is worse than none because it points somewhere false.
+    Mutation(
+        name="diagnose-blind-to-divergence",
+        file="mini_nccl/diagnose.py",
+        old="        if len(set(signatures.values())) <= 1:\n            continue",
+        new="        if True:\n            continue",
+        breaks="the desync analysis never reports a divergence, so a hung job "
+        "gets a clean bill of health",
+        tests=["tests/test_faults.py::test_desync_times_out_with_diagnosis"],
+    ),
+    Mutation(
+        name="diagnose-straggler-inverted",
+        file="mini_nccl/diagnose.py",
+        old="            if value * factor < across:",
+        new="            if value > factor * across:",
+        breaks="straggler detection blames the ranks that were waiting instead "
+        "of the one they waited for (a mistake I made writing it)",
+        tests=["tests/test_overlap.py::test_diagnose_names_a_straggler"],
+    ),
+    Mutation(
         name="launcher-swallow-errors",
         file="mini_nccl/launcher.py",
         old="    if errors:\n        detail =",

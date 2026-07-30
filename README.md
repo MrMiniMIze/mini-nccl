@@ -86,7 +86,7 @@ flowchart TB
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 71 tests, world sizes 1-8
+pytest -q                                        # 78 tests, world sizes 1-8
 mypy mini_nccl --ignore-missing-imports          # clean across 15 modules
 python scripts/mutation_check.py                 # do the tests have teeth?
 
@@ -747,7 +747,8 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q     # 71 tests, ~10 min (process spawn dominates)
+pytest -q                    # 78 tests, ~7 min (process spawn dominates)
+pytest -q -m "not examples"   # skip the example smoke runs for a faster loop
 
 # Coverage needs multiprocessing awareness or it only sees the parent process
 # and reports about 24% against a real 93%.
@@ -776,6 +777,11 @@ coverage combine && coverage report
   inside pipeline inside data, on 8 ranks) must both match single-process
   training gradient by gradient; collectives must work unchanged on a subgroup;
   and the partitions must be provably orthogonal.
+- **The examples:** every command in the Quickstart is smoke-run in CI. They
+  are the first thing a visitor executes, they exercise wiring no unit test
+  touches (argument parsing, stage construction, corpus loading, sampling), and
+  this project has since moved every module onto a shared protocol. A synthetic
+  corpus keeps them hermetic, so they never reach for the network.
 - **Timing claims:** DDP must *dispatch* a bucket reduction before backward
   returns, and must not when overlap is disabled. A "+2%" throughput result
   cannot distinguish a working mechanism from a broken one, so the mechanism is
@@ -867,7 +873,8 @@ vacuous this project, that question needed an answer rather than an assumption.
 
 `scripts/mutation_check.py` breaks the library on purpose, one edit at a time,
 and checks the suite notices. Every mutation is a mistake a person could make.
-It runs in CI, and 13 of 14 real mutations are caught:
+It runs in CI, and all 18 real mutations are caught (17 on a GPU-less
+runner, where the device one is skipped rather than counted as missed):
 
 | mutation | what it breaks | caught by |
 |---|---|---|
@@ -885,6 +892,10 @@ It runs in CI, and 13 of 14 real mutations are caught:
 | `recorder-frozen-seq` | every collective records sequence 0, breaking desync detection | `test_desync_times_out_with_diagnosis` |
 | `launcher-swallow-errors` | worker failures discarded, so every test would pass regardless | `test_dead_rank_fails_fast` |
 | `device-stream-order` | the copy stream stops waiting for the reduction (a shipped bug) | `test_every_exchange_orders_the_copy_stream` |
+| `transport-partial-recv` | a receive stops looping, truncating any large message | `test_collective_battery` |
+| `transport-handshake-identity` | every dialer claims to be rank 0, misfiling connections | `test_collective_battery` |
+| `diagnose-blind-to-divergence` | the desync analysis never reports one, so a hung job looks healthy | `test_desync_times_out_with_diagnosis` |
+| `diagnose-straggler-inverted` | blames the ranks that waited instead of the one they waited for | `test_diagnose_names_a_straggler` |
 
 One mutation is a deliberate no-op that is *expected* to survive, because a
 checker that never reports a survivor cannot be trusted when it says everything
