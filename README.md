@@ -29,6 +29,54 @@ where one optimization measured slower and therefore ships off, and [what
 loopback hides](#what-loopback-teaches-and-what-it-hides), where a measured
 bandwidth ratio explains all four negative results at once.
 
+Current release: **v0.9.0**. 78 tests across world sizes 1 to 8, 93% coverage,
+mypy clean, 18 of 18 injected defects caught, and three CI jobs (lint,
+mutation, and the suite on both Linux and Windows).
+
+## What this demonstrates
+
+The collectives are the subject, but the engineering habits are the point:
+
+* **Optimization decisions come from cost models, not intuition.** An
+  alpha-beta fit shows the winning algorithm has the *worst* per-byte
+  efficiency (0.61 vs 1.98 GB/s) and wins purely by moving 1.5n bytes instead
+  of 6n. A bandwidth ratio predicts a copy-pipelining optimization can never
+  exceed 1.1x, so it ships disabled rather than shipping on faith.
+* **One model, many devices.** The same transformer is split by depth into
+  pipeline stages and by tensor dimension into parallel layers, then composed
+  into 2D and 3D meshes and verified gradient by gradient against
+  unpartitioned execution.
+* **The accelerator data path is measured, not assumed.** Pinned staging,
+  CUDA streams and events, and a cross-stream ordering race that no CPU test
+  could reach.
+* **Every claim here is checkable.** A mutation checker breaks the library one
+  edit at a time to prove the tests would notice, and it runs in CI.
+
+## Contents
+
+1. [What's inside](#whats-inside) and [Quickstart](#quickstart)
+2. [Results](#results), the [channel
+   ablation](#tuning-not-guessing-the-channel-ablation) where one optimization
+   measured slower, and [the alpha-beta cost model](#the-alpha-beta-cost-model)
+3. [How it works](#how-it-works): the four all-reduce algorithms, then
+   [DDP](#ddp-bucketing-gradient-views-overlap),
+   [FSDP](#fsdp-sharding-the-parameters-themselves), [tensor
+   parallel](#tensor-parallel-splitting-a-single-layer), [pipeline
+   parallel](#pipeline-parallel-splitting-the-stack-and-paying-for-the-bubble),
+   and [how they compose](#composing-them-sub-groups-and-a-2d-mesh)
+4. [What loopback teaches, and what it
+   hides](#what-loopback-teaches-and-what-it-hides), [device
+   tensors](#device-tensors-pinned-staging-and-a-ceiling-calculation), and [low
+   precision](#low-precision-the-error-is-in-the-hops-not-the-accumulator)
+5. [Reliability: a hang you can debug](#reliability-a-hang-you-can-debug)
+6. [The proof: a GPT trained entirely through
+   mini-nccl](#the-proof-a-gpt-trained-entirely-through-mini-nccl)
+7. [Testing](#testing), [what review found](#what-review-found), and [do the
+   tests have teeth?](#do-the-tests-have-teeth)
+8. [Running across machines](#running-across-machines),
+   [Limitations](#limitations-deliberate), [Roadmap](#roadmap), and
+   [Layout](#layout)
+
 ## What's inside
 
 | Layer | File | What it does |
