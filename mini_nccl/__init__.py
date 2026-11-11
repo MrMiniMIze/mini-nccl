@@ -45,6 +45,7 @@ from .mesh import ParallelMesh, SubGroup
 from .pipeline import PipelineParallel
 from .process_group import DEFAULT_N_CHANNELS, ProcessGroup
 from .recorder import Recorder
+from .transport import LinkModel
 
 __all__ = [
     "ALGORITHMS",
@@ -52,6 +53,7 @@ __all__ = [
     "CollectiveTimeoutError",
     "DistributedDataParallel",
     "FullyShardedDataParallel",
+    "LinkModel",
     "MiniNcclError",
     "ParallelMesh",
     "PeerClosedError",
@@ -72,7 +74,7 @@ __all__ = [
     "run",
 ]
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 _group: ProcessGroup | None = None
 

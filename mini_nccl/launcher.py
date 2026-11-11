@@ -23,7 +23,7 @@ from pathlib import Path
 from queue import Empty
 
 from .process_group import DEFAULT_N_CHANNELS, ProcessGroup
-from .transport import DEFAULT_OP_TIMEOUT
+from .transport import DEFAULT_OP_TIMEOUT, LinkModel
 
 
 def _free_ports(count: int) -> list[int]:
@@ -49,6 +49,7 @@ def _worker(fn, rank, world_size, addrs, args, result_q, options) -> None:
             n_channels=options.get("n_channels", DEFAULT_N_CHANNELS),
             op_timeout=options.get("op_timeout", DEFAULT_OP_TIMEOUT),
             trace=True if trace_dir else None,
+            link=options.get("link"),
         )
         try:
             result = fn(pg, *args)
@@ -77,11 +78,15 @@ def run(
     n_channels: int = DEFAULT_N_CHANNELS,
     op_timeout: float = DEFAULT_OP_TIMEOUT,
     trace_dir: str | Path | None = None,
+    link: LinkModel | None = None,
 ) -> list:
     """Run ``fn(pg, *args)`` on ``world_size`` local processes.
 
     Returns a list of per-rank return values, indexed by rank. ``fn`` must
     be picklable (defined at module level) because workers are spawned.
+    ``link`` shapes every rank's traffic to emulate a network (see
+    :class:`~mini_nccl.transport.LinkModel`); by default each worker reads the
+    ``MINI_NCCL_LINK_*`` environment variables.
     """
     ctx = mp.get_context("spawn")
     addrs = [("127.0.0.1", p) for p in _free_ports(world_size)]
@@ -89,6 +94,7 @@ def run(
         "n_channels": n_channels,
         "op_timeout": op_timeout,
         "trace_dir": str(trace_dir) if trace_dir else None,
+        "link": link,
     }
     result_q = ctx.Queue()
     procs = [

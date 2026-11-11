@@ -87,6 +87,15 @@ MUTATIONS: list[Mutation] = [
         tests=["tests/test_collectives.py::test_collective_battery"],
     ),
     Mutation(
+        name="halving-skip-fold-out",
+        file="mini_nccl/collectives.py",
+        old="    if folded:\n        _fold_out(pg, flat, r)",
+        new="    if folded:\n        pass  # mutation: the result never goes back",
+        breaks="at a world size that is not a power of two, the ranks that folded "
+        "into a partner keep their own input instead of the result",
+        tests=["tests/test_collectives.py::test_halving_doubling_at_any_world_size"],
+    ),
+    Mutation(
         name="ddp-no-average",
         file="mini_nccl/ddp.py",
         old="                bucket.buffer.div_(self.pg.world_size)",
@@ -201,11 +210,69 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         name="transport-handshake-identity",
         file="mini_nccl/transport.py",
-        old="        conn.send(memoryview(_HANDSHAKE.pack(self.rank, channel)))",
-        new="        conn.send(memoryview(_HANDSHAKE.pack(0, channel)))",
+        old="                _MAGIC, PROTOCOL_VERSION, self.rank, channel, self._fingerprint\n",
+        new="                _MAGIC, PROTOCOL_VERSION, 0, channel, self._fingerprint\n",
         breaks="every dialing rank claims to be rank 0, so connections are "
         "filed against the wrong peers",
         tests=["tests/test_collectives.py::test_collective_battery"],
+    ),
+    Mutation(
+        name="transport-handshake-no-timeout",
+        file="mini_nccl/transport.py",
+        old="conn.recv_by(memoryview(raw), time.monotonic() + _HANDSHAKE_TIMEOUT)",
+        new="conn.recv_by(memoryview(raw), time.monotonic() + self._op_timeout)",
+        breaks="the acceptor waits the full operation timeout for a handshake, so "
+        "one silent stray connection stalls rendezvous for every rank",
+        tests=["tests/test_transport.py::test_rendezvous_survives_stray_connections"],
+    ),
+    Mutation(
+        name="transport-handshake-per-read-timeout",
+        file="mini_nccl/transport.py",
+        old="conn.recv_by(memoryview(raw), time.monotonic() + _HANDSHAKE_TIMEOUT)",
+        new="conn.set_timeout(_HANDSHAKE_TIMEOUT) or conn.recv_into(memoryview(raw))",
+        breaks="the handshake budget restarts on every read, so a client "
+        "trickling its handshake one byte at a time holds the acceptor",
+        tests=["tests/test_transport.py::test_a_trickled_handshake_cannot_outlast_its_deadline"],
+    ),
+    Mutation(
+        name="pg-raw-connection-errors",
+        file="mini_nccl/process_group.py",
+        old="            self._mesh.conns[dst][channel].send(byte_view(tensor))\n"
+        "        except OSError as exc:",
+        new="            self._mesh.conns[dst][channel].send(byte_view(tensor))\n"
+        "        except TimeoutError as exc:",
+        breaks="only timeouts are translated, so a dead peer surfaces as a bare "
+        "socket error with no rank or collective named",
+        tests=["tests/test_transport.py::test_dead_peer_raises_peer_closed_with_context"],
+    ),
+    # The emulated link has to be right in the direction that matters: never
+    # faster than the rate it claims, and shared the way one NIC is shared.
+    Mutation(
+        name="link-never-waits",
+        file="mini_nccl/transport.py",
+        old="    if delay > 0:\n        time.sleep(delay)\n",
+        new="    if False:\n        time.sleep(delay)\n",
+        breaks="the emulated link books time but never waits for it, so a shaped "
+        "run is as fast as loopback",
+        tests=["tests/test_link.py::test_a_link_clock_never_beats_its_rate"],
+    ),
+    Mutation(
+        name="link-cap-per-connection",
+        file="mini_nccl/transport.py",
+        old="            egress.append(self._egress)\n",
+        new="            egress.append(LinkClock(self._egress.rate))\n",
+        breaks="each connection gets its own copy of the rank's link, so channels "
+        "and peers multiply the bandwidth and the naive bottleneck disappears",
+        tests=["tests/test_link.py::test_the_rank_cap_is_shared_by_every_channel"],
+    ),
+    Mutation(
+        name="link-ingress-unmetered",
+        file="mini_nccl/transport.py",
+        old="            self._ingress = LinkClock(_mbps_to_bytes(self.link.mbps))\n",
+        new="            self._ingress = None\n",
+        breaks="only sends are shaped, so a rank can take in several peers' data "
+        "at once at several times its link rate",
+        tests=["tests/test_link.py::test_the_rank_cap_meters_what_arrives"],
     ),
     # The diagnostic tooling needs its own mutations: it is the part of the
     # project whose whole job is to be right when everything else is wrong, and
@@ -227,6 +294,15 @@ MUTATIONS: list[Mutation] = [
         breaks="straggler detection blames the ranks that were waiting instead "
         "of the one they waited for (a mistake I made writing it)",
         tests=["tests/test_overlap.py::test_diagnose_names_a_straggler"],
+    ),
+    Mutation(
+        name="readme-checker-blind",
+        file="scripts/check_readme_claims.py",
+        old="            actual = str(truths[claim.truth])",
+        new='            actual = _normalize(match.group("n"))',
+        breaks="the README claims checker compares each number with itself, so "
+        "every stale count passes",
+        tests=["tests/test_readme_claims.py::test_checker_notices_a_wrong_number"],
     ),
     Mutation(
         name="launcher-swallow-errors",

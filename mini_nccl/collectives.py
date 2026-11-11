@@ -11,8 +11,9 @@ Four all-reduce strategies, mirroring the trade-offs inside NCCL:
   tensors.
 - ``halving``: recursive halving-doubling (Rabenseifner). Reduce-scatter by
   recursive halving, all-gather by recursive doubling: ring's per-rank byte
-  count with tree's ``2*log2(W)`` step count. Requires a power-of-two world
-  size; other world sizes fall back to ring.
+  count with tree's ``2*log2(W)`` step count. At a world size that is not a
+  power of two, the extra ranks fold into partners first and get the result
+  back last, two more full-tensor steps.
 - ``naive``: the parameter-server baseline; every rank sends to rank 0,
   which reduces and sends the result back. Rank 0 handles ``O(W * n)``
   bytes, so it is included mainly to show in benchmarks *why* the others
@@ -146,10 +147,6 @@ def all_reduce(
     nbytes = tensor.numel() * tensor.element_size()
     if algorithm == "auto":
         algorithm = "tree" if nbytes <= RING_THRESHOLD_BYTES else "ring"
-    if algorithm == "halving" and pg.world_size & (pg.world_size - 1):
-        # Non-power-of-two would need the extra-ranks fold-in step; ring is
-        # the honest fallback rather than a silently different algorithm.
-        algorithm = "ring"
 
     if wire_dtype is not None:
         if algorithm not in ("ring", "tree"):
@@ -290,15 +287,64 @@ def _ring_on_channel(
 
 
 def _halving_doubling(pg: Communicator, tensor: torch.Tensor, op: str) -> None:
-    """Recursive halving reduce-scatter, then recursive doubling all-gather.
+    """Recursive halving-doubling at any world size, folding in the remainder.
 
-    Rank ``r`` ends the halving phase owning segment ``r`` of the reduced
-    result (the bit pattern of the rank *is* the segment index, because the
-    splits walk from the most significant bit down), so the doubling phase
-    simply reverses the exchange order.
+    The exchange pattern needs a power-of-two group. With ``p`` the largest
+    power of two at or below ``W`` and ``extra = W - p``, the first
+    ``2 * extra`` ranks pair up: each even one hands its whole tensor to the
+    odd one above it and sits out, the ``p`` survivors run the power-of-two
+    algorithm, and each survivor hands the result back. Those two extra
+    full-tensor steps are the price of a world size that is not a power of
+    two: a rank in a folded pair moves ``2n`` more bytes than it would in a
+    power-of-two world.
     """
     W, r = pg.world_size, pg.rank
     flat = _flat(tensor)
+    p = 1 << (W.bit_length() - 1)
+    extra = W - p
+    folded = r < 2 * extra
+    if folded and r % 2 == 0:
+        pg.send(flat, r + 1)  # my input goes to my partner, and I sit out
+    else:
+        if folded:
+            theirs = torch.empty_like(flat)
+            pg.recv(theirs, r - 1)
+            _OPS[op](flat, theirs)
+
+        def real(v: int) -> int:
+            """The process-group rank of rank ``v`` of the power-of-two group."""
+            return 2 * v + 1 if v < extra else v + extra
+
+        _halving_doubling_pow2(pg, flat, op, r // 2 if folded else r - extra, p, real)
+    if folded:
+        _fold_out(pg, flat, r)
+
+
+def _fold_out(pg: Communicator, flat: torch.Tensor, r: int) -> None:
+    """A survivor hands the result back to the partner that sat out."""
+    if r % 2:
+        pg.send(flat, r - 1)
+    else:
+        pg.recv(flat, r + 1)
+
+
+def _halving_doubling_pow2(
+    pg: Communicator,
+    flat: torch.Tensor,
+    op: str,
+    r: int,
+    W: int,
+    real: Callable[[int], int],
+) -> None:
+    """Recursive halving reduce-scatter, then recursive doubling all-gather.
+
+    ``r`` and ``W`` are this rank and the size of a power-of-two group, and
+    ``real`` turns a rank in that group into a process-group rank. Rank ``r``
+    ends the halving phase owning segment ``r`` of the reduced result (the bit
+    pattern of the rank *is* the segment index, because the splits walk from
+    the most significant bit down), so the doubling phase simply reverses the
+    exchange order.
+    """
     chunk = -(-flat.numel() // W)
     padded = flat
     if chunk * W != flat.numel():
@@ -311,7 +357,7 @@ def _halving_doubling(pg: Communicator, tensor: torch.Tensor, op: str) -> None:
 
     mask = W >> 1
     while mask:
-        partner = r ^ mask
+        partner = real(r ^ mask)
         mid = (lo + hi) // 2
         if r & mask:
             send_view, keep = padded[lo:mid], padded[mid:hi]
@@ -335,7 +381,7 @@ def _halving_doubling(pg: Communicator, tensor: torch.Tensor, op: str) -> None:
 
     mask = 1
     while mask < W:
-        partner = r ^ mask
+        partner = real(r ^ mask)
         length = hi - lo
         if r & mask:
             pg.send_recv(padded[lo:hi], partner, padded[lo - length : lo], partner)

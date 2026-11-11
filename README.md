@@ -29,9 +29,10 @@ where one optimization measured slower and therefore ships off, and [what
 loopback hides](#what-loopback-teaches-and-what-it-hides), where a measured
 bandwidth ratio explains all four negative results at once.
 
-Current release: **v0.9.0**. 78 tests across world sizes 1 to 8, 93% coverage,
-mypy clean, 18 of 18 injected defects caught, and three CI jobs (lint,
-mutation, and the suite on both Linux and Windows).
+Current release: **v0.10.0**. 106 tests across world sizes 1 to 8, 91% coverage
+without a GPU (CI fails below 90%), mypy clean, 26 of 26 injected defects
+caught, and four CI jobs: lint, mutation, a clean install of the built wheel,
+and the suite on Linux, Windows and macOS, on Python 3.10, 3.12 and 3.13.
 
 ## What this demonstrates
 
@@ -65,7 +66,8 @@ The collectives are the subject, but the engineering habits are the point:
    parallel](#pipeline-parallel-splitting-the-stack-and-paying-for-the-bubble),
    and [how they compose](#composing-them-sub-groups-and-a-2d-mesh)
 4. [What loopback teaches, and what it
-   hides](#what-loopback-teaches-and-what-it-hides), [device
+   hides](#what-loopback-teaches-and-what-it-hides), [testing that on an
+   emulated link](#testing-the-argument-an-emulated-link), [device
    tensors](#device-tensors-pinned-staging-and-a-ceiling-calculation), and [low
    precision](#low-precision-the-error-is-in-the-hops-not-the-accumulator)
 5. [Reliability: a hang you can debug](#reliability-a-hang-you-can-debug)
@@ -81,7 +83,7 @@ The collectives are the subject, but the engineering habits are the point:
 
 | Layer | File | What it does |
 |---|---|---|
-| Transport | `mini_nccl/transport.py` | Full-mesh TCP rendezvous, N connections per peer ("channels"), zero-copy receives straight into tensor storage, bounded operation timeouts |
+| Transport | `mini_nccl/transport.py` | Full-mesh TCP rendezvous with a validated handshake, N connections per peer ("channels"), zero-copy receives straight into tensor storage, bounded operation timeouts, an optional emulated link (`LinkModel`: rate, per-flow rate, latency) |
 | Device path | `mini_nccl/device.py` | Pinned host staging (1.7x on the copy), CUDA streams and events, chunked copy/network pipeline for accelerator tensors |
 | Process group | `mini_nccl/process_group.py` | `send` / `recv` / full-duplex `send_recv` / sliced `send_recv`: the primitives everything else is built from |
 | Collectives | `mini_nccl/collectives.py` | `all_reduce` (ring, tree, halving-doubling, naive), `reduce_scatter`, `all_gather`, `broadcast`, `all_to_all`, `barrier`, optional narrow wire dtype |
@@ -94,7 +96,7 @@ The collectives are the subject, but the engineering habits are the point:
 | Flight recorder | `mini_nccl/recorder.py`, `diagnose.py` | Sequence-numbered collective log, Perfetto traces, desync diagnosis |
 | Launcher | `mini_nccl/launcher.py` | `mn.run(fn, world_size)`: spawn, rendezvous, collect results, notice dead ranks |
 | Examples | `examples/` | Char-level GPT under DDP, FSDP, tensor, pipeline, 2D and 3D meshes, plus a diagnosed hang |
-| Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit, low-precision study, PCIe copy-ceiling analysis |
+| Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit, low-precision study, PCIe copy-ceiling analysis, predictions tested on an emulated link |
 | Mutation check | `scripts/mutation_check.py` | Breaks the library on purpose to verify the tests would notice; runs in CI |
 
 Every layer is built on the one below it, and nothing reaches past its
@@ -134,8 +136,8 @@ flowchart TB
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 78 tests, world sizes 1-8
-mypy mini_nccl --ignore-missing-imports          # clean across 15 modules
+pytest -q                                        # 106 tests, world sizes 1-8
+mypy mini_nccl                                   # clean across 15 modules
 python scripts/mutation_check.py                 # do the tests have teeth?
 
 python examples/train_gpt.py --world-size 4 --steps 200 --sample
@@ -151,6 +153,7 @@ python benchmarks/fit_cost_model.py              # alpha-beta fit
 python benchmarks/bench_low_precision.py         # bfloat16 wire study
 python benchmarks/bench_copy_ceiling.py          # PCIe bandwidth, and the bound it implies
 python benchmarks/bench_device.py --channels 1   # device staging vs pipelining
+python benchmarks/bench_emulated_link.py         # the predictions, on an emulated link
 ```
 
 The API mirrors `torch.distributed`:
@@ -309,9 +312,17 @@ segment a rank ends up owning is exactly its own index, because the splits
 walk from the most significant bit down, which is what makes the doubling
 phase a simple reversal.
 
-It requires a power-of-two world size. Rather than silently doing something
-different, non-power-of-two world sizes fall back to ring; the general
-version needs an extra fold-in step for the remainder ranks.
+The exchange pattern needs a power-of-two group, so any other world size
+folds in first. With `p` the largest power of two at or below `W`, the first
+`2(W-p)` ranks pair up: each even one hands its whole tensor to its odd
+partner and sits out, the `p` survivors run the algorithm above, and each
+survivor hands the result back. (Earlier versions fell back to ring instead.)
+The fold costs two extra full-tensor steps, and how much that matters depends
+on what bytes cost. At 3 ranks on loopback, halving takes 0.63x to 0.77x of
+ring's time up to 1 MiB, because it has fewer steps. Above that the two are
+within noise of each other. On an emulated 1 Gb/s link, where bytes dominate,
+ring wins by 2.20x at 16 MiB. The byte count predicted 2.25x: a folded pair
+puts `3n` on the critical path against ring's `4n/3`.
 
 ### Algorithm selection
 
@@ -610,6 +621,44 @@ targets. Keeping the mechanisms and defaulting them off is the honest response:
 the code is ready for the hardware it was designed for, and the defaults suit
 the hardware it runs on.
 
+### Testing the argument: an emulated link
+
+An argument like the one above can be tested without a network. `LinkModel`
+makes a rank sleep for its bytes instead of copying them, so bytes cost time
+and the CPU sits idle while they move. Loopback has neither property.
+[docs/emulated-link.md](docs/emulated-link.md) committed numeric predictions
+and a ±15% pass band **before** the first shaped run. Then
+`bench_emulated_link.py` measured them, at 4 ranks and 16 MiB unless stated:
+
+| prediction | link | predicted | measured | verdict |
+|---|---|---|---|---|
+| naive / ring, 2, 4, 8 ranks | 1 Gb/s | 1.97x, 3.88x, 7.72x | 2.00x, 3.94x, 7.93x | holds |
+| first size where ring beats tree | 100 Mb/s; 1 Gb/s | 4 KiB; 64 KiB | 4 KiB; 16 KiB | holds; near miss |
+| tree / ring at 1 MiB, where `auto` picks tree | 1 Gb/s | 2.43x | 2.42x | holds |
+| bfloat16 wire speedup | 100 Mb/s; 1 Gb/s | 1.99x; 1.91x | 1.97x; 1.89x | holds |
+| DDP overlap gain | 0.1, 1, 4.7 Gb/s | 4%, 22%, 37% | 1.9%, 14.3%, 24.1% | shape holds, values miss |
+| 4 channels: per-rank; per-flow cap | 1 Gb/s | 1.00x; 3.50-3.94x | 1.01x; 3.90x | holds |
+| 16 slices vs 1 | 100 Mb/s, 1 Gb/s | 1.00x | 1.00x, 1.00x | holds |
+
+![predicted vs measured on an emulated link](docs/img/emulated_link.png)
+
+Once bytes are expensive, two of the four negative results above turn
+positive: the bfloat16 wire pays 1.9 to 2x, and overlap pays up to 24%. Slice
+pipelining stays at 1.00x, for the opposite reason it lost: on a slow link the
+reduction it hides is 0.2% of the step. Both misses trace to an input that was
+measured once. A slow sweep inflated ring's fitted α, and one slow run put
+backward at 100 ms instead of 62. The doc gives the size of each miss rather
+than refitting the model. The unshaped controls, run on the Apple M5 that
+measured this table, show that loopback numbers are machine-specific too.
+There overlap gains 12%, not 2%, and loopback moves 6 to 15 GB/s, not 0.5.
+
+One result is actionable. `algorithm="auto"` switches to ring at 1 MiB, a
+threshold tuned on loopback. On either emulated link ring already wins at 4 to
+16 KiB, so `auto` runs tree at 2 to 2.5x ring's time across everything in
+between. Emulation
+cannot show switch contention, loss or congestion control. Nor can it show
+the GPU staging prediction, which needs a fabric near PCIe speed and a GPU.
+
 ### Device tensors: pinned staging, and a ceiling calculation
 
 A socket can only send host memory, so a tensor on an accelerator has to be
@@ -705,7 +754,19 @@ mechanisms turn that into a diagnosis.
 
 **Bounded waits.** Every socket carries an operation timeout, so a dead or
 desynchronized peer raises `CollectiveTimeoutError` carrying the local rank's
-view of what it was waiting for.
+view of what it was waiting for. A peer whose connection drops or resets
+raises `PeerClosedError` with the same view, rather than a bare
+`BrokenPipeError` that names neither the peer nor the collective.
+
+**A rendezvous that trusts nothing.** Every connection opens with a handshake
+carrying a magic number, a protocol version, the dialer's rank and channel, and
+a fingerprint of the job's configuration (world size, channels, host list).
+Anything that fails a check is refused, and both sides say why: ranks that
+disagree about the host list fail at startup with "the job configuration
+differs", instead of connecting to the wrong peers. A connection that has not
+delivered its whole handshake within five seconds is dropped, so a port scanner,
+a stale process from an earlier run, or a client trickling one byte at a time
+cannot stall the job.
 
 **A flight recorder.** With `MINI_NCCL_TRACE=1` (or `run(..., trace_dir=...)`)
 every collective is sequence-numbered per channel and timed. Because ranks
@@ -795,20 +856,24 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q                    # 78 tests, ~7 min (process spawn dominates)
+pytest -q                    # 106 tests, ~7 min (process spawn dominates)
 pytest -q -m "not examples"   # skip the example smoke runs for a faster loop
 
 # Coverage needs multiprocessing awareness or it only sees the parent process
-# and reports about 24% against a real 93%.
+# and reports about 24% against a real 91% (measured without a GPU, so the
+# device path's CUDA-only branches are the main gap).
 COVERAGE_PROCESS_START=$PWD/pyproject.toml coverage run -m pytest -q
-coverage combine && coverage report
+coverage combine && coverage report --fail-under=90   # what CI enforces
 ```
 
 - **Collectives:** every collective x every algorithm x sum/max/min/prod x
   float32/int64 x sizes chosen to hit edge cases (one element, fewer elements
   than ranks, non-divisible sizes, multi-buffer messages), at world sizes 2,
   3, and 4, with expected values recomputed independently on every rank from
-  seeds. Plus explicit single-channel and all-channels-in-use cases.
+  seeds. Plus explicit single-channel and all-channels-in-use cases, and
+  halving-doubling alone at 3, 5, 6 and 7 ranks. That test also asserts from
+  the flight recorder that halving actually ran, since a silent ring fallback
+  would produce the same correct sums.
 - **DDP:** parity against single-process training (overlap on/off,
   multi-bucket, `no_sync()` accumulation), and initial-weight broadcast.
 - **FSDP:** the reassembled model must match single-process training step for
@@ -840,13 +905,26 @@ coverage combine && coverage report
   instead, which is the same fact the "+2%" reports.
 - **Low precision:** ring's error grows with world size while tree's does not,
   and a narrow wire still moves the right bits.
+- **Emulated link:** a shaped link must never deliver more than its rate: a
+  single flow, two threads on one link, two channels and two peers sharing a
+  rank's link, two senders converging on one receiver, an idle link (which
+  must bank no credit), and per-send latency. Every timing assertion is a
+  lower bound, because a loaded runner can always make a shaper slower but
+  nothing legitimate makes it faster. The collective battery also runs over a
+  shaped link, and with shaping off the transport must be the plain,
+  unshaped connection.
 - **Device path:** chunking covers the payload exactly and the pipelined ring
   agrees with the plain one at every chunk size; on a machine with a GPU, two
   further tests check both device paths and that the staging is genuinely
   pinned with its own stream. Those two are what caught the missing cross-stream
   dependency.
 - **Transport:** full-duplex ring rotation deadlock test, zero-copy
-  invariants.
+  invariants, a peer dying mid-send and mid-receive (each must raise
+  `PeerClosedError` naming the rank and collective), and rendezvous against a
+  silent stray connection, a garbage one, one that trickles its handshake a
+  byte at a time, a mismatched job configuration and a wrong protocol
+  version. Each of those tests was watched failing against the
+  code before the fix.
 - **Faults:** a rank dying mid-collective must surface in seconds; a desync
   must produce a timeout plus a diagnosis naming the divergent collective,
   including when the recorder's ring buffer has already discarded the start
@@ -854,6 +932,11 @@ coverage combine && coverage report
 - **Bootstrap:** two independently launched processes must find each other
   from environment variables alone, with no launcher wiring them together.
   That is the path a real cluster uses.
+- **The README itself:** every count it states (tests, modules, mutations,
+  protocol members, the version) is derived from the code by
+  `scripts/check_readme_claims.py`, which runs in CI and fails naming the line
+  of any number that has drifted. Two commits in this history exist only to
+  correct hand-edited counts; this is the check that makes a third unnecessary.
 
 ## What review found
 
@@ -901,10 +984,10 @@ Alongside those:
   uses. `ProcessGroup` and `SubGroup` both have to satisfy it, so
   "a subgroup is substitutable for the group it came from" is verified rather
   than asserted in prose.
-- **Coverage is 93%**, and the number itself was a lesson. The first run
-  reported 24%, because the tests spawn one process per rank and only the
-  parent was instrumented. A number that wrong is worse than none, so the
-  config now enables multiprocessing coverage (150 process files combined).
+- **Coverage is 91%** without a GPU, and the number itself was a lesson. The
+  first run reported 24%, because the tests spawn one process per rank and
+  only the parent was instrumented. A number that wrong is worse than none, so
+  the config now enables multiprocessing coverage, and CI fails below 90%.
 
 Three areas came back explicitly clean under review: the device path's
 cross-stream ordering (traced for 1, 2, 3, and N chunks and across ring-step
@@ -921,7 +1004,7 @@ vacuous this project, that question needed an answer rather than an assumption.
 
 `scripts/mutation_check.py` breaks the library on purpose, one edit at a time,
 and checks the suite notices. Every mutation is a mistake a person could make.
-It runs in CI, and all 18 real mutations are caught (17 on a GPU-less
+It runs in CI, and all 26 real mutations are caught (25 on a GPU-less
 runner, where the device one is skipped rather than counted as missed):
 
 | mutation | what it breaks | caught by |
@@ -929,6 +1012,7 @@ runner, where the device one is skipped rather than counted as missed):
 | `ring-send-index` | off-by-one in the ring reduce-scatter schedule | `test_collective_battery` |
 | `ring-skip-allgather` | one too few all-gather steps | `test_collective_battery` |
 | `halving-swap-halves` | halving-doubling keeps the half it should have sent | `test_collective_battery` |
+| `halving-skip-fold-out` | at a world size that is not a power of two, the folded ranks never get the result back | `test_halving_doubling_at_any_world_size` |
 | `ddp-no-average` | DDP sums gradients instead of averaging them | `test_ddp_matches_single_process` |
 | `ddp-no-overlap-dispatch` | the reducer is never dispatched during backward | `test_overlap.py` |
 | `fsdp-rng` | the recompute draws a different dropout mask (a shipped bug) | `test_recompute_replays_randomness` |
@@ -942,8 +1026,15 @@ runner, where the device one is skipped rather than counted as missed):
 | `device-stream-order` | the copy stream stops waiting for the reduction (a shipped bug) | `test_every_exchange_orders_the_copy_stream` |
 | `transport-partial-recv` | a receive stops looping, truncating any large message | `test_collective_battery` |
 | `transport-handshake-identity` | every dialer claims to be rank 0, misfiling connections | `test_collective_battery` |
+| `transport-handshake-no-timeout` | one silent stray connection stalls rendezvous for every rank | `test_rendezvous_survives_stray_connections` |
+| `transport-handshake-per-read-timeout` | the handshake budget restarts on every byte, so a trickling client holds the acceptor | `test_a_trickled_handshake_cannot_outlast_its_deadline` |
+| `pg-raw-connection-errors` | a dead peer surfaces as a bare socket error naming nothing | `test_dead_peer_raises_peer_closed_with_context` |
 | `diagnose-blind-to-divergence` | the desync analysis never reports one, so a hung job looks healthy | `test_desync_times_out_with_diagnosis` |
 | `diagnose-straggler-inverted` | blames the ranks that waited instead of the one they waited for | `test_diagnose_names_a_straggler` |
+| `readme-checker-blind` | the README claims checker compares each number with itself | `test_checker_notices_a_wrong_number` |
+| `link-never-waits` | the emulated link books time but never waits for it | `test_a_link_clock_never_beats_its_rate` |
+| `link-cap-per-connection` | every connection gets its own copy of the rank's link | `test_the_rank_cap_is_shared_by_every_channel` |
+| `link-ingress-unmetered` | only sends are shaped, so incast runs at several times the link rate | `test_the_rank_cap_meters_what_arrives` |
 
 One mutation is a deliberate no-op that is *expected* to survive, because a
 checker that never reports a survivor cannot be trusted when it says everything
@@ -979,7 +1070,10 @@ algorithms. `docs/multinode.md` covers running across hosts (each rank reads
 the ssh fan-out), along with the specific predictions to check on a real
 fabric: naive should collapse, ring's advantage should widen with world size,
 more channels should start paying, and slice pipelining may flip from a loss
-to a win.
+to a win. All four have since been tested on an emulated link
+([docs/emulated-link.md](docs/emulated-link.md)). The first two hold, channels
+pay only when the limit is per flow, and slice pipelining stays neutral on a
+slow link. A real fabric is still the test of everything emulation leaves out.
 
 ## Limitations (deliberate)
 
@@ -989,11 +1083,15 @@ to a win.
   end-to-end timings are noisy and say nothing about multi-GPU scaling. No
   comparison against NCCL itself: the `nccl` backend in `torch.distributed` is
   Linux-only. See `docs/cuda.md`.
+- **The emulated link models a host's NIC, not a network.** It caps each
+  rank's rate in each direction and, optionally, each connection's. It has no
+  switch contention, packet loss or congestion control, and its latency is a
+  delay per send rather than one that overlaps transmission. It shows what
+  happens when bytes are expensive and the CPU is free, not how a particular
+  fabric behaves.
 - **A process group is not thread-safe per channel.** Collectives must be
   issued in identical order on every rank, so callers serialize per channel.
   This is NCCL's contract too, and the DDP reducer is built around it.
-- **Halving-doubling needs a power-of-two world size** and falls back to ring
-  otherwise.
 - **No unused-parameter detection in DDP**, matching PyTorch's default.
 - **FSDP units must take one tensor and return one tensor** (the shape of a
   transformer block), and it recomputes rather than refilling freed storage.
@@ -1017,11 +1115,15 @@ to a win.
 - Measure the device path with **one GPU per rank** (it is correctness-verified
   on a single shared GPU today) and compare against **NCCL itself** through
   `torch.distributed`, which needs a Linux box since that backend is Linux-only.
-  A fabric fast enough to balance against PCIe is also the setting where the
-  four optimizations that lost on loopback should finally pay.
+  Emulation has tested three of the four optimizations that lost on loopback.
+  The fourth, pipelining the GPU staging copies, needs a fabric fast enough to
+  balance against PCIe, and this is the item that provides one.
+- Re-derive `RING_THRESHOLD_BYTES` for real links. On an emulated 100 Mb/s or
+  1 Gb/s link, ring beats tree from 4 to 16 KiB, so the loopback-tuned 1 MiB
+  switch costs 2 to 2.5x in between. It should be configurable like
+  `MINI_NCCL_CHANNEL_MIN_BYTES`, or derived from a measured alpha-beta fit.
 - Error feedback for low-precision reduction, carrying the per-hop rounding
   residual forward so ring's accuracy stops degrading with world size.
-- The general non-power-of-two halving-doubling with the remainder fold-in.
 
 ## Layout
 
@@ -1042,9 +1144,10 @@ mini_nccl/
   launcher.py         # local multi-process runner
 tests/                # collectives, DDP/FSDP/TP/PP parity, faults, precision
 benchmarks/           # sweep, tuning ablation, cost model, precision study
-scripts/              # mutation checker, multi-node launcher
+scripts/              # mutation checker, README claims checker, multi-node launcher
 examples/             # char-GPT (DDP, FSDP, tensor, pipeline, 2D, 3D), demos
 docs/multinode.md     # running on real hardware
+docs/emulated-link.md # predictions, committed first, then measured on an emulated link
 docs/cuda.md          # the device path, and how to enable it
 ```
 

@@ -23,9 +23,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from .errors import CollectiveTimeoutError
+from .errors import CollectiveTimeoutError, MiniNcclError, PeerClosedError
 from .recorder import Recorder, trace_enabled_by_env
-from .transport import DEFAULT_OP_TIMEOUT, Mesh, byte_view
+from .transport import DEFAULT_OP_TIMEOUT, LinkModel, Mesh, byte_view
 
 DEFAULT_BASE_PORT = 29500
 
@@ -50,7 +50,15 @@ class ProcessGroup:
         n_channels: int = DEFAULT_N_CHANNELS,
         op_timeout: float = DEFAULT_OP_TIMEOUT,
         trace: bool | None = None,
+        link: LinkModel | None = None,
     ) -> None:
+        """Connect this rank to every peer.
+
+        ``link`` emulates a network on this rank's traffic (see
+        :class:`~mini_nccl.transport.LinkModel`). When omitted it is read from
+        the ``MINI_NCCL_LINK_*`` environment variables; with neither, the
+        transport is unshaped.
+        """
         if not 0 <= rank < world_size:
             raise ValueError(f"rank {rank} out of range for world_size {world_size}")
         if n_channels < 1:
@@ -68,7 +76,10 @@ class ProcessGroup:
             addrs = default_addrs(world_size, base_port)
         if len(addrs) != world_size:
             raise ValueError("need one (host, port) address per rank")
-        self._mesh = Mesh(rank, world_size, addrs, n_channels, timeout, op_timeout)
+        self.link = link if link is not None else LinkModel.from_env()
+        self._mesh = Mesh(
+            rank, world_size, addrs, n_channels, timeout, op_timeout, link=self.link
+        )
         self._send_pools = [
             ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"mn-send-r{rank}-c{c}")
             for c in range(n_channels)
@@ -83,14 +94,14 @@ class ProcessGroup:
     def send(self, tensor: torch.Tensor, dst: int, channel: int = 0) -> None:
         try:
             self._mesh.conns[dst][channel].send(byte_view(tensor))
-        except TimeoutError as exc:
-            raise self._timeout_error("send", dst, channel) from exc
+        except OSError as exc:
+            raise self._transport_error("send", dst, channel, exc) from exc
 
     def recv(self, tensor: torch.Tensor, src: int, channel: int = 0) -> None:
         try:
             self._mesh.conns[src][channel].recv_into(byte_view(tensor))
-        except TimeoutError as exc:
-            raise self._timeout_error("recv", src, channel) from exc
+        except OSError as exc:
+            raise self._transport_error("recv", src, channel, exc) from exc
 
     def send_recv(
         self,
@@ -168,13 +179,30 @@ class ProcessGroup:
 
     # ---- diagnostics -----------------------------------------------------
 
-    def _timeout_error(self, direction: str, peer: int, channel: int) -> CollectiveTimeoutError:
-        return CollectiveTimeoutError(
+    def _transport_error(
+        self, direction: str, peer: int, channel: int, exc: OSError
+    ) -> MiniNcclError:
+        """Turn a socket failure into a library error that says what was going on.
+
+        A bare ``BrokenPipeError`` from deep inside a ring step names neither
+        the peer nor the collective. Every transport failure therefore carries
+        the same local view a timeout does, and its class says which of the two
+        it was: a peer that went quiet, or a peer whose connection went away.
+        """
+        if isinstance(exc, TimeoutError):
+            return CollectiveTimeoutError(
+                f"rank {self.rank}: {direction} on channel {channel} to/from rank {peer} "
+                f"exceeded {self.op_timeout}s.\n"
+                f"  local state: {self.recorder.context()}\n"
+                f"  likely cause: rank {peer} is dead, stuck, or issuing a different "
+                f"collective (ranks must call collectives in identical order)."
+            )
+        return PeerClosedError(
             f"rank {self.rank}: {direction} on channel {channel} to/from rank {peer} "
-            f"exceeded {self.op_timeout}s.\n"
+            f"failed: {exc}.\n"
             f"  local state: {self.recorder.context()}\n"
-            f"  likely cause: rank {peer} is dead, stuck, or issuing a different "
-            f"collective (ranks must call collectives in identical order)."
+            f"  likely cause: rank {peer} exited or crashed; its own log or exit "
+            f"code will say why."
         )
 
     def set_op_timeout(self, op_timeout: float | None) -> None:

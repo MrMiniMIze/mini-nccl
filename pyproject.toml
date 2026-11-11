@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mini-nccl"
-version = "0.9.0"
+# Read from mini_nccl.__version__, the single place the version is written.
+dynamic = ["version"]
 description = "A from-scratch collective communications library (ring, tree, and halving-doubling all-reduce over raw TCP) with all four parallelism strategies built on top of it: data parallel, fully sharded, tensor parallel, and pipeline"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -12,18 +13,31 @@ authors = [{ name = "MrMiniMIze" }]
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
+    # The transport reads and writes tensors through ``Tensor.numpy()`` (see
+    # ``byte_view`` in transport.py), so every send needs it. torch does not
+    # depend on numpy, and the CPU wheels do not pull it in.
+    "numpy",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
-    "numpy",
     "matplotlib",
     "ruff>=0.6",
+    "mypy>=1.8",
+    "coverage>=7.4",
 ]
 
 [tool.setuptools.packages.find]
 include = ["mini_nccl*"]
+
+[tool.setuptools.dynamic]
+# setuptools reads this literal statically (no import), so building the
+# package does not need torch installed.
+version = { attr = "mini_nccl.__version__" }
+
+[tool.setuptools.package-data]
+mini_nccl = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -31,6 +45,11 @@ addopts = "-ra"
 markers = [
     "examples: smoke-runs an example script in a subprocess (slower; deselect with -m 'not examples')",
 ]
+
+[tool.mypy]
+# torch ships its own types; matplotlib and the rest are only used outside
+# the package, but a stub-less import anywhere should not fail the check.
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 96
