@@ -29,7 +29,7 @@ where one optimization measured slower and therefore ships off, and [what
 loopback hides](#what-loopback-teaches-and-what-it-hides), where a measured
 bandwidth ratio explains all four negative results at once.
 
-Current release: **v0.9.0**. 102 tests across world sizes 1 to 8, 91% coverage
+Current release: **v0.10.0**. 102 tests across world sizes 1 to 8, 91% coverage
 without a GPU (CI fails below 90%), mypy clean, 25 of 25 injected defects
 caught, and four CI jobs: lint, mutation, a clean install of the built wheel,
 and the suite on Linux, Windows and macOS, on Python 3.10, 3.12 and 3.13.
@@ -66,7 +66,8 @@ The collectives are the subject, but the engineering habits are the point:
    parallel](#pipeline-parallel-splitting-the-stack-and-paying-for-the-bubble),
    and [how they compose](#composing-them-sub-groups-and-a-2d-mesh)
 4. [What loopback teaches, and what it
-   hides](#what-loopback-teaches-and-what-it-hides), [device
+   hides](#what-loopback-teaches-and-what-it-hides), [testing that on an
+   emulated link](#testing-the-argument-an-emulated-link), [device
    tensors](#device-tensors-pinned-staging-and-a-ceiling-calculation), and [low
    precision](#low-precision-the-error-is-in-the-hops-not-the-accumulator)
 5. [Reliability: a hang you can debug](#reliability-a-hang-you-can-debug)
@@ -95,7 +96,7 @@ The collectives are the subject, but the engineering habits are the point:
 | Flight recorder | `mini_nccl/recorder.py`, `diagnose.py` | Sequence-numbered collective log, Perfetto traces, desync diagnosis |
 | Launcher | `mini_nccl/launcher.py` | `mn.run(fn, world_size)`: spawn, rendezvous, collect results, notice dead ranks |
 | Examples | `examples/` | Char-level GPT under DDP, FSDP, tensor, pipeline, 2D and 3D meshes, plus a diagnosed hang |
-| Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit, low-precision study, PCIe copy-ceiling analysis |
+| Benchmarks | `benchmarks/` | nccl-tests-style sweep, tuning ablation, alpha-beta cost model fit, low-precision study, PCIe copy-ceiling analysis, predictions tested on an emulated link |
 | Mutation check | `scripts/mutation_check.py` | Breaks the library on purpose to verify the tests would notice; runs in CI |
 
 Every layer is built on the one below it, and nothing reaches past its
@@ -152,6 +153,7 @@ python benchmarks/fit_cost_model.py              # alpha-beta fit
 python benchmarks/bench_low_precision.py         # bfloat16 wire study
 python benchmarks/bench_copy_ceiling.py          # PCIe bandwidth, and the bound it implies
 python benchmarks/bench_device.py --channels 1   # device staging vs pipelining
+python benchmarks/bench_emulated_link.py         # the predictions, on an emulated link
 ```
 
 The API mirrors `torch.distributed`:
@@ -611,6 +613,44 @@ targets. Keeping the mechanisms and defaulting them off is the honest response:
 the code is ready for the hardware it was designed for, and the defaults suit
 the hardware it runs on.
 
+### Testing the argument: an emulated link
+
+An argument like the one above can be tested without a network. `LinkModel`
+makes a rank sleep for its bytes instead of copying them, so bytes cost time
+and the CPU sits idle while they move. Loopback has neither property.
+[docs/emulated-link.md](docs/emulated-link.md) committed numeric predictions
+and a ±15% pass band **before** the first shaped run. Then
+`bench_emulated_link.py` measured them, at 4 ranks and 16 MiB unless stated:
+
+| prediction | link | predicted | measured | verdict |
+|---|---|---|---|---|
+| naive / ring, 2, 4, 8 ranks | 1 Gb/s | 1.97x, 3.88x, 7.72x | 2.00x, 3.94x, 7.93x | holds |
+| first size where ring beats tree | 100 Mb/s; 1 Gb/s | 4 KiB; 64 KiB | 4 KiB; 16 KiB | holds; near miss |
+| tree / ring at 1 MiB, where `auto` picks tree | 1 Gb/s | 2.43x | 2.42x | holds |
+| bfloat16 wire speedup | 100 Mb/s; 1 Gb/s | 1.99x; 1.91x | 1.97x; 1.89x | holds |
+| DDP overlap gain | 0.1, 1, 4.7 Gb/s | 4%, 22%, 37% | 1.9%, 14.3%, 24.1% | shape holds, values miss |
+| 4 channels: per-rank; per-flow cap | 1 Gb/s | 1.00x; 3.50-3.94x | 1.01x; 3.90x | holds |
+| 16 slices vs 1 | 100 Mb/s, 1 Gb/s | 1.00x | 1.00x, 1.00x | holds |
+
+![predicted vs measured on an emulated link](docs/img/emulated_link.png)
+
+Once bytes are expensive, two of the four negative results above turn
+positive: the bfloat16 wire pays 1.9 to 2x, and overlap pays up to 24%. Slice
+pipelining stays at 1.00x, for the opposite reason it lost: on a slow link the
+reduction it hides is 0.2% of the step. Both misses trace to an input that was
+measured once. A slow sweep inflated ring's fitted α, and one slow run put
+backward at 100 ms instead of 62. The doc gives the size of each miss rather
+than refitting the model. The unshaped controls, run on the Apple M5 that
+measured this table, show that loopback numbers are machine-specific too.
+There overlap gains 12%, not 2%, and loopback moves 6 to 15 GB/s, not 0.5.
+
+One result is actionable. `algorithm="auto"` switches to ring at 1 MiB, a
+threshold tuned on loopback. On either emulated link ring already wins at 4 to
+16 KiB, so `auto` runs tree at 2 to 2.5x ring's time across everything in
+between. Emulation
+cannot show switch contention, loss or congestion control. Nor can it show
+the GPU staging prediction, which needs a fabric near PCIe speed and a GPU.
+
 ### Device tensors: pinned staging, and a ceiling calculation
 
 A socket can only send host memory, so a tensor on an accelerator has to be
@@ -1018,7 +1058,10 @@ algorithms. `docs/multinode.md` covers running across hosts (each rank reads
 the ssh fan-out), along with the specific predictions to check on a real
 fabric: naive should collapse, ring's advantage should widen with world size,
 more channels should start paying, and slice pipelining may flip from a loss
-to a win.
+to a win. All four have since been tested on an emulated link
+([docs/emulated-link.md](docs/emulated-link.md)). The first two hold, channels
+pay only when the limit is per flow, and slice pipelining stays neutral on a
+slow link. A real fabric is still the test of everything emulation leaves out.
 
 ## Limitations (deliberate)
 
@@ -1028,6 +1071,12 @@ to a win.
   end-to-end timings are noisy and say nothing about multi-GPU scaling. No
   comparison against NCCL itself: the `nccl` backend in `torch.distributed` is
   Linux-only. See `docs/cuda.md`.
+- **The emulated link models a host's NIC, not a network.** It caps each
+  rank's rate in each direction and, optionally, each connection's. It has no
+  switch contention, packet loss or congestion control, and its latency is a
+  delay per send rather than one that overlaps transmission. It shows what
+  happens when bytes are expensive and the CPU is free, not how a particular
+  fabric behaves.
 - **A process group is not thread-safe per channel.** Collectives must be
   issued in identical order on every rank, so callers serialize per channel.
   This is NCCL's contract too, and the DDP reducer is built around it.
@@ -1056,8 +1105,13 @@ to a win.
 - Measure the device path with **one GPU per rank** (it is correctness-verified
   on a single shared GPU today) and compare against **NCCL itself** through
   `torch.distributed`, which needs a Linux box since that backend is Linux-only.
-  A fabric fast enough to balance against PCIe is also the setting where the
-  four optimizations that lost on loopback should finally pay.
+  Emulation has tested three of the four optimizations that lost on loopback.
+  The fourth, pipelining the GPU staging copies, needs a fabric fast enough to
+  balance against PCIe, and this is the item that provides one.
+- Re-derive `RING_THRESHOLD_BYTES` for real links. On an emulated 100 Mb/s or
+  1 Gb/s link, ring beats tree from 4 to 16 KiB, so the loopback-tuned 1 MiB
+  switch costs 2 to 2.5x in between. It should be configurable like
+  `MINI_NCCL_CHANNEL_MIN_BYTES`, or derived from a measured alpha-beta fit.
 - Error feedback for low-precision reduction, carrying the per-hop rounding
   residual forward so ring's accuracy stops degrading with world size.
 - The general non-power-of-two halving-doubling with the remainder fold-in.
@@ -1084,6 +1138,7 @@ benchmarks/           # sweep, tuning ablation, cost model, precision study
 scripts/              # mutation checker, README claims checker, multi-node launcher
 examples/             # char-GPT (DDP, FSDP, tensor, pipeline, 2D, 3D), demos
 docs/multinode.md     # running on real hardware
+docs/emulated-link.md # predictions, committed first, then measured on an emulated link
 docs/cuda.md          # the device path, and how to enable it
 ```
 

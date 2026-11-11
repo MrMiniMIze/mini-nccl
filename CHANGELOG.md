@@ -3,8 +3,18 @@
 Newest first. Each entry says what changed and why it matters; the commit
 history has the detail.
 
-## Unreleased
+## 0.10.0 (2026-11-11)
 
+- Test the README's loopback argument on an emulated link, with predictions
+  committed before the measurements (`docs/emulated-link.md`,
+  `benchmarks/bench_emulated_link.py`). Fourteen of eighteen hold, one is a
+  near miss, and three miss. Once bytes are expensive, the bfloat16 wire pays
+  1.9 to 2x and DDP overlap up to 24%. Naive collapses by a factor of the world
+  size. Channels pay only under a per-flow cap, and slice pipelining stays
+  neutral. Both misses trace to inputs measured once. One result is
+  actionable: on a real link ring beats tree from a few KiB, so `auto`'s
+  loopback-tuned 1 MiB switch is 2 to 2.5x slow in between (now on the
+  roadmap).
 - Add an emulated link: `LinkModel(mbps=..., flow_mbps=..., latency_us=...)`
   (or `MINI_NCCL_LINK_MBPS`, `_FLOW_MBPS`, `_LATENCY_US`) rate-limits and
   delays a rank's traffic, so bytes cost time and the CPU sits idle while they

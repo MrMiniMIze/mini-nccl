@@ -10,9 +10,10 @@ network.
 
 `mini_nccl.LinkModel` emulates one. This document writes down, with numbers,
 what the emulated link should show, **before** anything was measured on it.
-The measurements arrive in the next commit, so the history shows that these
-predictions were not fitted to the results. The pass/fail tolerance is fixed
-here too, for the same reason.
+Everything above [the results](#the-results) was committed on its own, ahead of
+the measurements, so the history shows that these predictions were not fitted
+to the results. The pass/fail tolerance was fixed then too, for the same
+reason.
 
 ## The emulator
 
@@ -214,3 +215,148 @@ re-tuned model. The experiments are `benchmarks/bench_emulated_link.py`
 (added with the measurements); the unshaped inputs come from its
 `--unshaped-inputs` mode and from `bench_allreduce.py` plus
 `fit_cost_model.py`.
+
+## The results
+
+Measured on the same machine, the same day, with every experiment in one run:
+
+```bash
+python benchmarks/bench_emulated_link.py --ddp-extra-rate 4700   # 194 s
+python benchmarks/plot_results.py                                # the chart below
+```
+
+Raw times are in `benchmarks/results/emulated_link.csv`. Each time is the
+slowest rank's mean over the timed iterations.
+
+| # | prediction | link | predicted | measured | verdict |
+|---|---|---|---|---|---|
+| 1 | naive / ring, 2 ranks | 1 Gb/s | 1.97x | 2.00x | **holds** |
+| 1 | naive / ring, 4 ranks | 1 Gb/s | 3.88x | 3.94x | **holds** |
+| 1 | naive / ring, 8 ranks | 1 Gb/s | 7.72x | 7.93x | **holds** |
+| 1 | naive / ring, 4 ranks | 100 Mb/s | 3.99x | 3.94x | **holds** |
+| 2 | first size where ring beats tree | 100 Mb/s | 4 KiB | 4 KiB | **holds** |
+| 2 | first size where ring beats tree | 1 Gb/s | 64 KiB | 16 KiB | **near miss**, one step early |
+| 2 | tree / ring at 1 MiB, where `auto` picks tree | 100 Mb/s | 2.64x | 2.52x | **holds** |
+| 2 | tree / ring at 1 MiB, where `auto` picks tree | 1 Gb/s | 2.43x | 2.42x | **holds** |
+| 3 | bfloat16 wire speedup | 100 Mb/s | 1.99x | 1.97x | **holds** |
+| 3 | bfloat16 wire speedup | 1 Gb/s | 1.91x | 1.89x | **holds** |
+| 4 | DDP overlap gain | 100 Mb/s | 4.0% | 1.9% | **miss** |
+| 4 | DDP overlap gain | 1 Gb/s | 22% | 14.3% | **miss** |
+| 4 | DDP overlap gain | 4.7 Gb/s | 37% | 24.1% | **miss** |
+| 4 | gain lowest at 100 Mb/s, highest at the balanced rate | | rises with rate | 1.9%, 14.3%, 24.1% | **holds** |
+| 5 | 2 / 4 channels, per-rank cap | 1 Gb/s | 1.00x / 1.00x | 1.01x / 1.01x | **holds** |
+| 5 | 2 / 4 channels, per-flow cap | 1 Gb/s | 1.91-1.99x / 3.50-3.94x | 2.00x / 3.90x | **holds** |
+| 6 | 16 slices vs 1 | 100 Mb/s | 1.00x | 1.00x | **holds** |
+| 6 | 16 slices vs 1 | 1 Gb/s | 1.00x | 1.00x | **holds** |
+
+Fourteen of eighteen hold, one is a near miss, and three miss, all of them in
+the same prediction. Every prediction that depended only on counting bytes
+landed within 5%. Both the near miss and the misses trace back to an input
+that was measured once, not to the emulator or the byte arithmetic. [What
+the misses have in common](#what-the-misses-have-in-common) is the most useful
+part of this document.
+
+![predicted vs measured](img/emulated_link.png)
+
+### 1. Naive collapses: holds, at every world size
+
+Naive's time is `W` times ring's to within 3% at 2, 4 and 8 ranks, at both
+rates. Ring's own time grows only from 135 to 236 ms between 2 and 8 ranks at
+1 Gb/s, because its per-rank traffic approaches `2n` and stops growing. Naive
+goes from 270 ms to 1.87 s. The unshaped control, run in the same sweep, gives
+0.89x, 1.20x and 1.36x, so on this machine's loopback naive is *faster* than
+ring at 2 ranks. This is the clearest case of loopback hiding something.
+
+### 2. The crossover moves down by orders of magnitude: holds, with one near miss
+
+At 100 Mb/s ring first wins at 4 KiB, as predicted. At 1 Gb/s it already wins
+at 16 KiB (tree/ring 1.11) where the model said tree would still be ahead
+(0.72), so the crossover is one grid step below the prediction. The
+consequence the prediction was about holds exactly: at 1 MiB, where
+`algorithm="auto"` picks tree, tree takes **2.52x** ring's time at 100 Mb/s
+and **2.42x** at 1 Gb/s. The loopback control is the opposite: tree wins at
+every size up to 1 MiB (0.70 at 1 MiB). On either emulated link, the 1 MiB
+threshold is wrong by two orders of magnitude.
+
+**Why the near miss.** Tree's measured times match the model almost exactly
+(1.76 ms predicted and measured at 4 KiB, 100 Mb/s). Ring's do not: at small
+sizes it runs about twice as fast as modeled. The ring α (148 µs per step)
+came from an earlier `bench_allreduce.py` sweep, whose small-message ring
+points were slow (0.76 ms at 4 KiB, 1.42 ms at 16 KiB). This run's own unshaped control
+measures the same sizes at 0.34 to 0.36 ms, about 60 µs per step. The fit
+charged ring for latency it does not have, which pushed the predicted
+crossover up. The emulator was not the problem; the input was a noisy run.
+
+### 3. A bfloat16 wire halves the time: holds
+
+1.97x at 100 Mb/s and 1.89x at 1 Gb/s, within 2% of the prediction. The casts
+cost so little against a link this slow that halving the bytes halves the
+time. The unshaped control gives 1.07x, inside the README's 0.95x to 1.28x.
+The README's negative result was a property of loopback, not of the
+mechanism.
+
+### 4. DDP overlap: the shape holds, the numbers miss, all three on the low side
+
+The gain rises with link rate as predicted (1.9%, 14.3%, 24.1%) but is a
+third to a half below each predicted value. The cause is again an input. The
+prediction used a backward pass of 100 ms, from one unshaped run made earlier.
+In this sweep backward takes 61 to 68 ms in all eight configurations, and three
+fresh `--unshaped-inputs` runs give 61.6, 61.9 and 62.5 ms. The earlier run was
+1.3 to 1.6x slower in *every* part (forward, backward, sync, optimizer), which
+points to the machine's state during that one run, not to any one component.
+Overlap can hide at most the backward time, so the ceiling was overstated by
+the same factor of 1.6.
+
+Recomputing the ceiling `min(backward, communication) / step` from each
+configuration's own measured parts (an explanation, not a new verdict) gives
+2.5%, 15.4% and 32.8%. The first two measurements come within about 1 point
+of that. At 4.7 Gb/s the measurement stays 9 points short. There
+communication (79 ms) and backward (63 ms) are close to balanced, and the
+model's assumption of perfect hiding is at its weakest. The reducer cannot
+start before the first bucket is ready, and running it costs backward a few
+milliseconds (67 vs 63 ms).
+
+The communication side of the model was accurate where bytes dominate:
+285 ms measured against 283 ms predicted at 1 Gb/s. At 4.7 Gb/s it was 79 ms
+against 102 ms predicted, which is the same inflated ring α as in prediction 2,
+since DDP sends 37 small buckets.
+
+The unshaped control gains **12.1%** here, against the README's +2% on its own
+machine. That is a second sign that the README's loopback results describe
+that machine's loopback, not loopback in general.
+
+### 5. Channels help only under a per-flow cap: holds
+
+Under a per-rank cap, 2 and 4 channels are both 1.01x of one channel. Under a
+per-flow cap they are 2.00x and 3.90x, at the top of the predicted ranges,
+which suggests the CPU work split across the channel threads too. "More
+channels" is advice about per-flow limits (TCP window, per-connection rate
+limits, NICs that hash flows to queues), not about link capacity.
+
+### 6. Slice pipelining: holds, no gain and no loss
+
+0.998x at 100 Mb/s and 1.001x at 1 Gb/s. The unshaped control is still a loss
+(0.94x), as on the README's machine. The disagreement with
+docs/multinode.md's "may flip to a win" goes this document's way: on a link
+slow enough for the transfer to leave the CPU idle, there is nothing left for
+pipelining to hide.
+
+## What the misses have in common
+
+Both misses came from inputs measured once: an earlier all-reduce sweep's
+small-message points and the one unshaped DDP run. Both were slow outliers,
+and each pushed its prediction in a predictable direction. The model was
+not re-fitted after the fact, because that would make the predictions
+unfalsifiable. The repair belongs upstream: measure the inputs more than once,
+in the same session as the experiment. The unshaped controls now run in the
+same sweep for that reason, and the gap between the controls and the inputs
+is what exposed both misses.
+
+Of the README's four negative results, two turn positive under emulation:
+the bfloat16 wire pays 1.9 to 2x, and overlap pays up to 24% when
+communication and backward are close to balanced. Slice pipelining stays
+neutral, for a reason that can now be stated with a number. The fourth, GPU
+staging, is the README's strongest prediction and still needs hardware this
+machine does not have. Separately, docs/multinode.md's predictions about
+naive, ring and channels hold, with the crossover lower than anyone tuning on
+loopback would guess.

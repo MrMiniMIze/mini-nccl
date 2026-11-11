@@ -1,0 +1,109 @@
+experiment,link,world,config,bytes,seconds,iters
+naive,1000 Mb/s,2,ring,16777216,1.352321e-01,7
+naive,1000 Mb/s,2,naive,16777216,2.700308e-01,4
+naive,1000 Mb/s,4,ring,16777216,2.028210e-01,5
+naive,1000 Mb/s,4,naive,16777216,7.996408e-01,2
+naive,1000 Mb/s,8,ring,16777216,2.362126e-01,4
+naive,1000 Mb/s,8,naive,16777216,1.872999e+00,2
+naive,100 Mb/s,4,ring,16777216,2.021922e+00,2
+naive,100 Mb/s,4,naive,16777216,7.959145e+00,2
+naive,loopback,2,ring,16777216,3.042967e-03,50
+naive,loopback,2,naive,16777216,2.714244e-03,50
+naive,loopback,4,ring,16777216,6.832822e-03,50
+naive,loopback,4,naive,16777216,8.228887e-03,50
+naive,loopback,8,ring,16777216,1.492726e-02,50
+naive,loopback,8,naive,16777216,2.036652e-02,47
+crossover,100 Mb/s,4,ring,1024,5.443592e-04,50
+crossover,100 Mb/s,4,tree,1024,5.172258e-04,50
+crossover,100 Mb/s,4,ring,4096,9.808042e-04,50
+crossover,100 Mb/s,4,tree,4096,1.758693e-03,50
+crossover,100 Mb/s,4,ring,16384,2.883159e-03,50
+crossover,100 Mb/s,4,tree,16384,6.923914e-03,50
+crossover,100 Mb/s,4,ring,65536,1.085985e-02,43
+crossover,100 Mb/s,4,tree,65536,2.622216e-02,19
+crossover,100 Mb/s,4,ring,262144,3.956555e-02,13
+crossover,100 Mb/s,4,tree,262144,9.033605e-02,6
+crossover,100 Mb/s,4,ring,1048576,1.359721e-01,4
+crossover,100 Mb/s,4,tree,1048576,3.421486e-01,2
+crossover,1000 Mb/s,4,ring,1024,5.365408e-04,50
+crossover,1000 Mb/s,4,tree,1024,1.416567e-04,50
+crossover,1000 Mb/s,4,ring,4096,5.216550e-04,50
+crossover,1000 Mb/s,4,tree,4096,2.741767e-04,50
+crossover,1000 Mb/s,4,ring,16384,6.935350e-04,50
+crossover,1000 Mb/s,4,tree,16384,7.676192e-04,50
+crossover,1000 Mb/s,4,ring,65536,1.371741e-03,50
+crossover,1000 Mb/s,4,tree,65536,2.831192e-03,50
+crossover,1000 Mb/s,4,ring,262144,4.594108e-03,50
+crossover,1000 Mb/s,4,tree,262144,9.307292e-03,50
+crossover,1000 Mb/s,4,ring,1048576,1.429825e-02,35
+crossover,1000 Mb/s,4,tree,1048576,3.465544e-02,15
+crossover,loopback,4,ring,1024,3.450633e-04,50
+crossover,loopback,4,tree,1024,1.081383e-04,50
+crossover,loopback,4,ring,4096,3.428117e-04,50
+crossover,loopback,4,tree,4096,7.178584e-05,50
+crossover,loopback,4,ring,16384,3.604817e-04,50
+crossover,loopback,4,tree,16384,7.504500e-05,50
+crossover,loopback,4,ring,65536,3.703450e-04,50
+crossover,loopback,4,tree,65536,9.095168e-05,50
+crossover,loopback,4,ring,262144,3.992258e-04,50
+crossover,loopback,4,tree,262144,1.735933e-04,50
+crossover,loopback,4,ring,1048576,6.296792e-04,50
+crossover,loopback,4,tree,1048576,4.399542e-04,50
+bf16,100 Mb/s,4,ring,16777216,2.022986e+00,2
+bf16,100 Mb/s,4,ring+bf16,16777216,1.028328e+00,2
+bf16,1000 Mb/s,4,ring,16777216,2.030039e-01,5
+bf16,1000 Mb/s,4,ring+bf16,16777216,1.073634e-01,9
+bf16,loopback,4,ring,16777216,6.822952e-03,50
+bf16,loopback,4,ring+bf16,16777216,6.389308e-03,50
+ddp,100 Mb/s,4,no-overlap:step,0,2.694055e+00,4
+ddp,100 Mb/s,4,no-overlap:forward,0,4.227404e-02,4
+ddp,100 Mb/s,4,no-overlap:backward,0,6.759786e-02,4
+ddp,100 Mb/s,4,no-overlap:sync,0,2.560842e+00,4
+ddp,100 Mb/s,4,no-overlap:optimizer,0,2.327331e-02,4
+ddp,100 Mb/s,4,overlap:step,0,2.642685e+00,4
+ddp,100 Mb/s,4,overlap:forward,0,4.568078e-02,4
+ddp,100 Mb/s,4,overlap:backward,0,6.247200e-02,4
+ddp,100 Mb/s,4,overlap:sync,0,2.504375e+00,4
+ddp,100 Mb/s,4,overlap:optimizer,0,3.007346e-02,4
+ddp,1000 Mb/s,4,no-overlap:step,0,4.001350e-01,10
+ddp,1000 Mb/s,4,no-overlap:forward,0,3.824154e-02,10
+ddp,1000 Mb/s,4,no-overlap:backward,0,6.142639e-02,10
+ddp,1000 Mb/s,4,no-overlap:sync,0,2.854381e-01,10
+ddp,1000 Mb/s,4,no-overlap:optimizer,0,1.497576e-02,10
+ddp,1000 Mb/s,4,overlap:step,0,3.428564e-01,10
+ddp,1000 Mb/s,4,overlap:forward,0,3.885565e-02,10
+ddp,1000 Mb/s,4,overlap:backward,0,6.389657e-02,10
+ddp,1000 Mb/s,4,overlap:sync,0,2.252605e-01,10
+ddp,1000 Mb/s,4,overlap:optimizer,0,1.476960e-02,10
+ddp,4700 Mb/s,4,no-overlap:step,0,1.906997e-01,10
+ddp,4700 Mb/s,4,no-overlap:forward,0,3.724727e-02,10
+ddp,4700 Mb/s,4,no-overlap:backward,0,6.258525e-02,10
+ddp,4700 Mb/s,4,no-overlap:sync,0,7.905060e-02,10
+ddp,4700 Mb/s,4,no-overlap:optimizer,0,1.176276e-02,10
+ddp,4700 Mb/s,4,overlap:step,0,1.447438e-01,10
+ddp,4700 Mb/s,4,overlap:forward,0,3.592582e-02,10
+ddp,4700 Mb/s,4,overlap:backward,0,6.684403e-02,10
+ddp,4700 Mb/s,4,overlap:sync,0,3.005223e-02,10
+ddp,4700 Mb/s,4,overlap:optimizer,0,1.185959e-02,10
+ddp,loopback,4,no-overlap:step,0,1.399130e-01,10
+ddp,loopback,4,no-overlap:forward,0,3.845826e-02,10
+ddp,loopback,4,no-overlap:backward,0,6.190672e-02,10
+ddp,loopback,4,no-overlap:sync,0,2.766080e-02,10
+ddp,loopback,4,no-overlap:optimizer,0,1.183224e-02,10
+ddp,loopback,4,overlap:step,0,1.230109e-01,10
+ddp,loopback,4,overlap:forward,0,3.720872e-02,10
+ddp,loopback,4,overlap:backward,0,6.824872e-02,10
+ddp,loopback,4,overlap:sync,0,5.591338e-03,10
+ddp,loopback,4,overlap:optimizer,0,1.191420e-02,10
+channels,1000 Mb/s per-rank,4,1ch,16777216,2.047676e-01,5
+channels,1000 Mb/s per-rank,4,2ch,16777216,2.026714e-01,5
+channels,1000 Mb/s per-rank,4,4ch,16777216,2.026387e-01,5
+channels,1000 Mb/s per-flow,4,1ch,16777216,2.081028e-01,5
+channels,1000 Mb/s per-flow,4,2ch,16777216,1.037975e-01,10
+channels,1000 Mb/s per-flow,4,4ch,16777216,5.336878e-02,19
+slices,100 Mb/s,4,slices=1,16777216,2.021083e+00,2
+slices,1000 Mb/s,4,slices=1,16777216,2.028824e-01,5
+slices,loopback,4,slices=1,16777216,7.103468e-03,50
+slices,100 Mb/s,4,slices=16,16777216,2.025569e+00,2
+slices,1000 Mb/s,4,slices=16,16777216,2.026420e-01,5
+slices,loopback,4,slices=16,16777216,7.527961e-03,50
