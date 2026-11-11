@@ -5,6 +5,13 @@ history has the detail.
 
 ## 0.10.0 (2026-11-11)
 
+- Halving-doubling now works at any world size. Instead of falling back to
+  ring, the ranks above the largest power of two fold into a partner, sit out
+  the exchange and get the result back. At 3 ranks on loopback it takes 0.63x
+  to 0.77x of ring's time up to 1 MiB. On an emulated 1 Gb/s link the fold's
+  two extra full-tensor steps make it 2.2x slower than ring at 16 MiB, as
+  the byte count predicts. A new mutation checks that the result is handed
+  back.
 - Test the README's loopback argument on an emulated link, with predictions
   committed before the measurements (`docs/emulated-link.md`,
   `benchmarks/bench_emulated_link.py`). Fourteen of eighteen hold, one is a

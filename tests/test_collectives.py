@@ -124,6 +124,36 @@ def test_collective_battery_over_an_emulated_link() -> None:
     run(_battery_worker, 3, link=LinkModel(mbps=4000, latency_us=50))
 
 
+def _halving_worker(pg) -> list[str]:
+    """Halving-doubling alone, every op and dtype; returns the algorithms run."""
+    pg.recorder.enabled = True
+    for op in ("sum", "max", "min", "prod"):
+        for dtype in (torch.float32, torch.int64):
+            for numel in NUMELS:
+                if op == "prod" and numel > 1024:
+                    continue
+                t = _rank_tensor(pg.rank, numel, dtype)
+                c.all_reduce(pg, t, op=op, algorithm="halving")
+                case = f"halving/{op}/{dtype}/{numel}"
+                torch.testing.assert_close(
+                    t, _expected_reduce(pg.world_size, numel, dtype, op), rtol=1e-4, atol=1e-4,
+                    msg=lambda m, case=case: f"all_reduce {case}: {m}",
+                )
+    events = pg.recorder.state()["events"]
+    return sorted({ev["algorithm"] for ev in events if ev["op"] == "all_reduce"})
+
+
+@pytest.mark.parametrize("world_size", [3, 5, 6, 7])
+def test_halving_doubling_at_any_world_size(world_size: int) -> None:
+    """Not a power of two: the extra ranks fold in, and the result folds back out.
+
+    The returned algorithm names are the point of the test as much as the
+    values: a ring fallback would also produce the right sums, so correctness
+    alone could not tell the general algorithm from its absence.
+    """
+    assert run(_halving_worker, world_size) == [["halving"]] * world_size
+
+
 def _multichannel_worker(pg) -> None:
     """A payload the ring must split across every channel."""
     assert pg.n_channels == 4

@@ -50,8 +50,9 @@ def steps_and_byte_factor(algorithm: str, world: int) -> tuple[int, float]:
 
     - ring: 2(W-1) steps, each rank moves 2(W-1)/W of the payload
     - tree: 2*ceil(log2 W) steps; the root forwards the whole payload each time
-    - halving: 2*log2(W) steps with ring's byte count (falls back to ring
-      when W is not a power of two)
+    - halving: 2*log2(W) steps with ring's byte count. When W is not a
+      power of two, the run is over p = 2**floor(log2 W) ranks plus a
+      full-payload fold-in and fold-out on the critical path
     - naive: rank 0 serially receives from and sends to W-1 peers
     """
     log2w = math.ceil(math.log2(world))
@@ -60,8 +61,9 @@ def steps_and_byte_factor(algorithm: str, world: int) -> tuple[int, float]:
     if algorithm == "tree":
         return 2 * log2w, 2 * log2w
     if algorithm == "halving":
-        if world & (world - 1):
-            return 2 * (world - 1), 2 * (world - 1) / world
+        p = 1 << (world.bit_length() - 1)
+        if p != world:
+            return 2 * int(math.log2(p)) + 2, 2 * (p - 1) / p + 2
         return 2 * log2w, 2 * (world - 1) / world
     if algorithm == "naive":
         return 2 * (world - 1), 2 * (world - 1)

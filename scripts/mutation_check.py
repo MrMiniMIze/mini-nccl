@@ -87,6 +87,15 @@ MUTATIONS: list[Mutation] = [
         tests=["tests/test_collectives.py::test_collective_battery"],
     ),
     Mutation(
+        name="halving-skip-fold-out",
+        file="mini_nccl/collectives.py",
+        old="    if folded:\n        _fold_out(pg, flat, r)",
+        new="    if folded:\n        pass  # mutation: the result never goes back",
+        breaks="at a world size that is not a power of two, the ranks that folded "
+        "into a partner keep their own input instead of the result",
+        tests=["tests/test_collectives.py::test_halving_doubling_at_any_world_size"],
+    ),
+    Mutation(
         name="ddp-no-average",
         file="mini_nccl/ddp.py",
         old="                bucket.buffer.div_(self.pg.world_size)",
