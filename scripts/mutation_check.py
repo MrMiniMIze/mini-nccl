@@ -229,6 +229,15 @@ MUTATIONS: list[Mutation] = [
         tests=["tests/test_overlap.py::test_diagnose_names_a_straggler"],
     ),
     Mutation(
+        name="readme-checker-blind",
+        file="scripts/check_readme_claims.py",
+        old="            actual = str(truths[claim.truth])",
+        new='            actual = _normalize(match.group("n"))',
+        breaks="the README claims checker compares each number with itself, so "
+        "every stale count passes",
+        tests=["tests/test_readme_claims.py::test_checker_notices_a_wrong_number"],
+    ),
+    Mutation(
         name="launcher-swallow-errors",
         file="mini_nccl/launcher.py",
         old="    if errors:\n        detail =",

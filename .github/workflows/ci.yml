@@ -20,6 +20,9 @@ jobs:
           pip install -e .[dev]
       - run: ruff check .
       - run: mypy mini_nccl
+      # Every count the README states (tests, modules, mutations, protocol
+      # members, version) is derived from the code and compared.
+      - run: python scripts/check_readme_claims.py
 
   # Checks that the tests would fail if the library broke. --strict also fails
   # if a mutation can no longer be applied, so the checker cannot quietly rot

@@ -29,8 +29,8 @@ where one optimization measured slower and therefore ships off, and [what
 loopback hides](#what-loopback-teaches-and-what-it-hides), where a measured
 bandwidth ratio explains all four negative results at once.
 
-Current release: **v0.9.0**. 78 tests across world sizes 1 to 8, 91% coverage
-without a GPU (CI fails below 90%), mypy clean, 18 of 18 injected defects
+Current release: **v0.9.0**. 83 tests across world sizes 1 to 8, 91% coverage
+without a GPU (CI fails below 90%), mypy clean, 19 of 19 injected defects
 caught, and four CI jobs: lint, mutation, a clean install of the built wheel,
 and the suite on Linux, Windows and macOS, on Python 3.10, 3.12 and 3.13.
 
@@ -135,7 +135,7 @@ flowchart TB
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 78 tests, world sizes 1-8
+pytest -q                                        # 83 tests, world sizes 1-8
 mypy mini_nccl                                   # clean across 15 modules
 python scripts/mutation_check.py                 # do the tests have teeth?
 
@@ -796,7 +796,7 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q                    # 78 tests, ~7 min (process spawn dominates)
+pytest -q                    # 83 tests, ~7 min (process spawn dominates)
 pytest -q -m "not examples"   # skip the example smoke runs for a faster loop
 
 # Coverage needs multiprocessing awareness or it only sees the parent process
@@ -856,6 +856,11 @@ coverage combine && coverage report --fail-under=90   # what CI enforces
 - **Bootstrap:** two independently launched processes must find each other
   from environment variables alone, with no launcher wiring them together.
   That is the path a real cluster uses.
+- **The README itself:** every count it states (tests, modules, mutations,
+  protocol members, the version) is derived from the code by
+  `scripts/check_readme_claims.py`, which runs in CI and fails naming the line
+  of any number that has drifted. Two commits in this history exist only to
+  correct hand-edited counts; this is the check that makes a third unnecessary.
 
 ## What review found
 
@@ -923,7 +928,7 @@ vacuous this project, that question needed an answer rather than an assumption.
 
 `scripts/mutation_check.py` breaks the library on purpose, one edit at a time,
 and checks the suite notices. Every mutation is a mistake a person could make.
-It runs in CI, and all 18 real mutations are caught (17 on a GPU-less
+It runs in CI, and all 19 real mutations are caught (18 on a GPU-less
 runner, where the device one is skipped rather than counted as missed):
 
 | mutation | what it breaks | caught by |
@@ -946,6 +951,7 @@ runner, where the device one is skipped rather than counted as missed):
 | `transport-handshake-identity` | every dialer claims to be rank 0, misfiling connections | `test_collective_battery` |
 | `diagnose-blind-to-divergence` | the desync analysis never reports one, so a hung job looks healthy | `test_desync_times_out_with_diagnosis` |
 | `diagnose-straggler-inverted` | blames the ranks that waited instead of the one they waited for | `test_diagnose_names_a_straggler` |
+| `readme-checker-blind` | the README claims checker compares each number with itself | `test_checker_notices_a_wrong_number` |
 
 One mutation is a deliberate no-op that is *expected* to survive, because a
 checker that never reports a survivor cannot be trusted when it says everything
@@ -1044,7 +1050,7 @@ mini_nccl/
   launcher.py         # local multi-process runner
 tests/                # collectives, DDP/FSDP/TP/PP parity, faults, precision
 benchmarks/           # sweep, tuning ablation, cost model, precision study
-scripts/              # mutation checker, multi-node launcher
+scripts/              # mutation checker, README claims checker, multi-node launcher
 examples/             # char-GPT (DDP, FSDP, tensor, pipeline, 2D, 3D), demos
 docs/multinode.md     # running on real hardware
 docs/cuda.md          # the device path, and how to enable it

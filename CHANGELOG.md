@@ -5,6 +5,12 @@ history has the detail.
 
 ## Unreleased
 
+- Check the README's numbers instead of maintaining them.
+  `scripts/check_readme_claims.py` derives the test, module, mutation and
+  protocol-member counts and the version from the code, fails naming the line
+  of any that drifted, and runs in CI. It has its own mutation, so a checker
+  that stops checking is caught.
+- Single-source the version: `pyproject.toml` reads `mini_nccl.__version__`.
 - Declare `numpy` as a runtime dependency. Every send goes through
   `Tensor.numpy()`, but numpy was only listed under the `dev` extra, so a plain
   `pip install` could not move a byte. A new CI job installs the built wheel
