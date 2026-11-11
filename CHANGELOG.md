@@ -5,6 +5,13 @@ history has the detail.
 
 ## Unreleased
 
+- Add an emulated link: `LinkModel(mbps=..., flow_mbps=..., latency_us=...)`
+  (or `MINI_NCCL_LINK_MBPS`, `_FLOW_MBPS`, `_LATENCY_US`) rate-limits and
+  delays a rank's traffic, so bytes cost time and the CPU sits idle while they
+  move, as on a real NIC. The rate is per rank, in each direction, shared by
+  every connection and channel; a link clock books each chunk's serialization
+  time with no idle credit, so small messages pay their real cost. With
+  shaping off, the transport is the plain unshaped connection.
 - A peer whose connection drops or resets now raises `PeerClosedError`
   carrying the same local state a timeout does. Before, only timeouts were
   translated, and a dead peer surfaced as a bare `ConnectionResetError`.

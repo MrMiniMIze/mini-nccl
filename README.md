@@ -29,8 +29,8 @@ where one optimization measured slower and therefore ships off, and [what
 loopback hides](#what-loopback-teaches-and-what-it-hides), where a measured
 bandwidth ratio explains all four negative results at once.
 
-Current release: **v0.9.0**. 89 tests across world sizes 1 to 8, 91% coverage
-without a GPU (CI fails below 90%), mypy clean, 22 of 22 injected defects
+Current release: **v0.9.0**. 102 tests across world sizes 1 to 8, 91% coverage
+without a GPU (CI fails below 90%), mypy clean, 25 of 25 injected defects
 caught, and four CI jobs: lint, mutation, a clean install of the built wheel,
 and the suite on Linux, Windows and macOS, on Python 3.10, 3.12 and 3.13.
 
@@ -82,7 +82,7 @@ The collectives are the subject, but the engineering habits are the point:
 
 | Layer | File | What it does |
 |---|---|---|
-| Transport | `mini_nccl/transport.py` | Full-mesh TCP rendezvous with a validated handshake, N connections per peer ("channels"), zero-copy receives straight into tensor storage, bounded operation timeouts |
+| Transport | `mini_nccl/transport.py` | Full-mesh TCP rendezvous with a validated handshake, N connections per peer ("channels"), zero-copy receives straight into tensor storage, bounded operation timeouts, an optional emulated link (`LinkModel`: rate, per-flow rate, latency) |
 | Device path | `mini_nccl/device.py` | Pinned host staging (1.7x on the copy), CUDA streams and events, chunked copy/network pipeline for accelerator tensors |
 | Process group | `mini_nccl/process_group.py` | `send` / `recv` / full-duplex `send_recv` / sliced `send_recv`: the primitives everything else is built from |
 | Collectives | `mini_nccl/collectives.py` | `all_reduce` (ring, tree, halving-doubling, naive), `reduce_scatter`, `all_gather`, `broadcast`, `all_to_all`, `barrier`, optional narrow wire dtype |
@@ -135,7 +135,7 @@ flowchart TB
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 89 tests, world sizes 1-8
+pytest -q                                        # 102 tests, world sizes 1-8
 mypy mini_nccl                                   # clean across 15 modules
 python scripts/mutation_check.py                 # do the tests have teeth?
 
@@ -808,7 +808,7 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q                    # 89 tests, ~7 min (process spawn dominates)
+pytest -q                    # 102 tests, ~7 min (process spawn dominates)
 pytest -q -m "not examples"   # skip the example smoke runs for a faster loop
 
 # Coverage needs multiprocessing awareness or it only sees the parent process
@@ -854,6 +854,14 @@ coverage combine && coverage report --fail-under=90   # what CI enforces
   instead, which is the same fact the "+2%" reports.
 - **Low precision:** ring's error grows with world size while tree's does not,
   and a narrow wire still moves the right bits.
+- **Emulated link:** a shaped link must never deliver more than its rate: a
+  single flow, two threads on one link, two channels and two peers sharing a
+  rank's link, two senders converging on one receiver, an idle link (which
+  must bank no credit), and per-send latency. Every timing assertion is a
+  lower bound, because a loaded runner can always make a shaper slower but
+  nothing legitimate makes it faster. The collective battery also runs over a
+  shaped link, and with shaping off the transport must be the plain,
+  unshaped connection.
 - **Device path:** chunking covers the payload exactly and the pipelined ring
   agrees with the plain one at every chunk size; on a machine with a GPU, two
   further tests check both device paths and that the staging is genuinely
@@ -945,7 +953,7 @@ vacuous this project, that question needed an answer rather than an assumption.
 
 `scripts/mutation_check.py` breaks the library on purpose, one edit at a time,
 and checks the suite notices. Every mutation is a mistake a person could make.
-It runs in CI, and all 22 real mutations are caught (21 on a GPU-less
+It runs in CI, and all 25 real mutations are caught (24 on a GPU-less
 runner, where the device one is skipped rather than counted as missed):
 
 | mutation | what it breaks | caught by |
@@ -972,6 +980,9 @@ runner, where the device one is skipped rather than counted as missed):
 | `diagnose-blind-to-divergence` | the desync analysis never reports one, so a hung job looks healthy | `test_desync_times_out_with_diagnosis` |
 | `diagnose-straggler-inverted` | blames the ranks that waited instead of the one they waited for | `test_diagnose_names_a_straggler` |
 | `readme-checker-blind` | the README claims checker compares each number with itself | `test_checker_notices_a_wrong_number` |
+| `link-never-waits` | the emulated link books time but never waits for it | `test_a_link_clock_never_beats_its_rate` |
+| `link-cap-per-connection` | every connection gets its own copy of the rank's link | `test_the_rank_cap_is_shared_by_every_channel` |
+| `link-ingress-unmetered` | only sends are shaped, so incast runs at several times the link rate | `test_the_rank_cap_meters_what_arrives` |
 
 One mutation is a deliberate no-op that is *expected* to survive, because a
 checker that never reports a survivor cannot be trusted when it says everything

@@ -25,7 +25,7 @@ import torch
 
 from .errors import CollectiveTimeoutError, MiniNcclError, PeerClosedError
 from .recorder import Recorder, trace_enabled_by_env
-from .transport import DEFAULT_OP_TIMEOUT, Mesh, byte_view
+from .transport import DEFAULT_OP_TIMEOUT, LinkModel, Mesh, byte_view
 
 DEFAULT_BASE_PORT = 29500
 
@@ -50,7 +50,15 @@ class ProcessGroup:
         n_channels: int = DEFAULT_N_CHANNELS,
         op_timeout: float = DEFAULT_OP_TIMEOUT,
         trace: bool | None = None,
+        link: LinkModel | None = None,
     ) -> None:
+        """Connect this rank to every peer.
+
+        ``link`` emulates a network on this rank's traffic (see
+        :class:`~mini_nccl.transport.LinkModel`). When omitted it is read from
+        the ``MINI_NCCL_LINK_*`` environment variables; with neither, the
+        transport is unshaped.
+        """
         if not 0 <= rank < world_size:
             raise ValueError(f"rank {rank} out of range for world_size {world_size}")
         if n_channels < 1:
@@ -68,7 +76,10 @@ class ProcessGroup:
             addrs = default_addrs(world_size, base_port)
         if len(addrs) != world_size:
             raise ValueError("need one (host, port) address per rank")
-        self._mesh = Mesh(rank, world_size, addrs, n_channels, timeout, op_timeout)
+        self.link = link if link is not None else LinkModel.from_env()
+        self._mesh = Mesh(
+            rank, world_size, addrs, n_channels, timeout, op_timeout, link=self.link
+        )
         self._send_pools = [
             ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"mn-send-r{rank}-c{c}")
             for c in range(n_channels)

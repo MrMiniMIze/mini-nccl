@@ -236,6 +236,35 @@ MUTATIONS: list[Mutation] = [
         "socket error with no rank or collective named",
         tests=["tests/test_transport.py::test_dead_peer_raises_peer_closed_with_context"],
     ),
+    # The emulated link has to be right in the direction that matters: never
+    # faster than the rate it claims, and shared the way one NIC is shared.
+    Mutation(
+        name="link-never-waits",
+        file="mini_nccl/transport.py",
+        old="    if delay > 0:\n        time.sleep(delay)\n",
+        new="    if False:\n        time.sleep(delay)\n",
+        breaks="the emulated link books time but never waits for it, so a shaped "
+        "run is as fast as loopback",
+        tests=["tests/test_link.py::test_a_link_clock_never_beats_its_rate"],
+    ),
+    Mutation(
+        name="link-cap-per-connection",
+        file="mini_nccl/transport.py",
+        old="            egress.append(self._egress)\n",
+        new="            egress.append(LinkClock(self._egress.rate))\n",
+        breaks="each connection gets its own copy of the rank's link, so channels "
+        "and peers multiply the bandwidth and the naive bottleneck disappears",
+        tests=["tests/test_link.py::test_the_rank_cap_is_shared_by_every_channel"],
+    ),
+    Mutation(
+        name="link-ingress-unmetered",
+        file="mini_nccl/transport.py",
+        old="            self._ingress = LinkClock(_mbps_to_bytes(self.link.mbps))\n",
+        new="            self._ingress = None\n",
+        breaks="only sends are shaped, so a rank can take in several peers' data "
+        "at once at several times its link rate",
+        tests=["tests/test_link.py::test_the_rank_cap_meters_what_arrives"],
+    ),
     # The diagnostic tooling needs its own mutations: it is the part of the
     # project whose whole job is to be right when everything else is wrong, and
     # a broken diagnosis is worse than none because it points somewhere false.

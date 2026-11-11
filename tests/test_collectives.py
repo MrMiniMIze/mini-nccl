@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from mini_nccl import LinkModel
 from mini_nccl import collectives as c
 from mini_nccl.launcher import run
 
@@ -111,6 +112,16 @@ def _battery_worker(pg) -> None:
 @pytest.mark.parametrize("world_size", [2, 3, 4])
 def test_collective_battery(world_size: int) -> None:
     run(_battery_worker, world_size)
+
+
+def test_collective_battery_over_an_emulated_link() -> None:
+    """Shaping changes when bytes arrive, never which bytes arrive.
+
+    A rate cap and per-send latency reorder nothing on a TCP stream, but they
+    change every timing relationship between threads and ranks, which is where
+    a latent ordering bug would show. One world size is enough to say so.
+    """
+    run(_battery_worker, 3, link=LinkModel(mbps=4000, latency_us=50))
 
 
 def _multichannel_worker(pg) -> None:

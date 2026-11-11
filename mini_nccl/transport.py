@@ -26,16 +26,23 @@ Design notes:
 - Every socket carries an operation timeout. Blocking forever on a dead or
   desynchronized peer is the failure mode that makes real distributed jobs
   undebuggable, so the default is a bounded wait that raises.
+- An optional **emulated link** (:class:`LinkModel`) rate-limits and delays
+  every send. Loopback "networking" is a memory copy done by the same cores
+  that do the reduction, which hides exactly the costs the algorithms exist to
+  manage; a shaped link makes bytes cost time while leaving the CPU idle, the
+  way a NIC does. See docs/emulated-link.md.
 """
 
 from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import socket
 import struct
 import threading
 import time
+from dataclasses import dataclass
 
 import torch
 
@@ -74,6 +81,120 @@ DEFAULT_OP_TIMEOUT = 300.0
 
 # How often the accepter checks whether the rendezvous has been abandoned.
 _ACCEPT_POLL_SECONDS = 0.5
+
+
+# ---- emulated link ----------------------------------------------------------
+
+#: Largest piece a shaped send hands to the socket at once. Small enough that
+#: concurrent senders interleave fairly, large enough that the per-chunk
+#: bookkeeping is noise next to the time the chunk is charged for.
+_SHAPE_CHUNK = 64 * 1024
+
+
+@dataclass(frozen=True)
+class LinkModel:
+    """An emulated network link, applied to every send a rank makes.
+
+    ``mbps`` caps the rank's traffic in megabits per second, in each
+    direction, shared by every connection and channel it has: one full-duplex
+    NIC per host. That sharing is the point. It is what makes the naive
+    algorithm's bottleneck real, because rank 0 has to take in ``W-1`` tensors
+    and push out ``W-1`` copies of the result through one link; a cap per
+    connection would quietly hand it ``W-1`` links instead.
+
+    ``flow_mbps`` additionally caps each connection on its own, which models a
+    per-flow limit (a congestion window, a per-stream offload). Only under a
+    per-flow cap is "do more channels help?" a fair question.
+
+    ``latency_us`` is a fixed delay added once per send call: the per-message
+    alpha of the alpha-beta model, not a propagation delay that pipelines.
+    """
+
+    mbps: float | None = None
+    flow_mbps: float | None = None
+    latency_us: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in ("mbps", "flow_mbps"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"LinkModel.{name} must be positive, got {value}")
+        if self.latency_us < 0:
+            raise ValueError(f"LinkModel.latency_us must be >= 0, got {self.latency_us}")
+
+    @property
+    def shaped(self) -> bool:
+        return bool(self.mbps or self.flow_mbps or self.latency_us)
+
+    @classmethod
+    def from_env(cls) -> LinkModel:
+        """Read ``MINI_NCCL_LINK_MBPS``, ``_FLOW_MBPS`` and ``_LATENCY_US``."""
+
+        def number(name: str) -> float | None:
+            raw = os.environ.get(name, "").strip()
+            return float(raw) if raw else None
+
+        return cls(
+            mbps=number("MINI_NCCL_LINK_MBPS"),
+            flow_mbps=number("MINI_NCCL_LINK_FLOW_MBPS"),
+            latency_us=number("MINI_NCCL_LINK_LATENCY_US") or 0.0,
+        )
+
+
+# How far a later chunk of the same message may book back in time to absorb
+# timer overshoot. Bounded so that a sender which stalled on a full socket
+# buffer resumes at the link rate rather than in a burst.
+_CATCH_UP_S = 0.002
+
+
+class LinkClock:
+    """When one direction of an emulated link is next free.
+
+    Each chunk books ``nbytes / rate`` seconds, starting no earlier than the
+    previous booking ends, and whoever booked it waits until it ends. Bookings
+    never overlap, so the bytes through one clock cannot exceed ``rate`` over
+    any interval. The guarantee is one-sided on purpose: a loaded machine can
+    deliver less than the rate, never more.
+
+    Three details carry the fidelity:
+
+    - **No idle credit.** A message's first chunk books from "now" at the
+      earliest, so an idle link does not bank time. (A token bucket with a burst
+      allowance does bank it, and that erases the serialization delay of every
+      message smaller than the burst, which is exactly the regime where tree
+      beats ring.)
+    - **No drift.** Later chunks of a message may book from where the previous
+      one ended even if the sender woke late, so timer overshoot (coarse on
+      Windows) is absorbed instead of accumulating, within ``_CATCH_UP_S``.
+      Time is always measured, never inferred from the sleep that was asked for.
+    - **No double charge.** The receive side books a chunk as having *finished*
+      arriving when it arrived, so one flow already paced by its sender passes
+      straight through, while several senders converging on one receiver
+      (rank 0 in the naive algorithm) queue on its ingress.
+    """
+
+    def __init__(self, bytes_per_second: float) -> None:
+        self.rate = float(bytes_per_second)
+        self._free_at = 0.0
+        self._lock = threading.Lock()
+
+    def book(self, nbytes: int, earliest: float) -> float:
+        """Book ``nbytes`` starting no earlier than ``earliest``; return its end."""
+        # The lock covers arithmetic only; waiting happens outside it.
+        with self._lock:
+            start = max(self._free_at, earliest)
+            self._free_at = start + nbytes / self.rate
+            return self._free_at
+
+
+def _wait_until(deadline: float) -> None:
+    delay = deadline - time.perf_counter()
+    if delay > 0:
+        time.sleep(delay)
+
+
+def _mbps_to_bytes(mbps: float) -> float:
+    return mbps * 1e6 / 8
 
 
 def job_fingerprint(world_size: int, n_channels: int, addrs: list[tuple[str, int]]) -> int:
@@ -150,6 +271,50 @@ class Connection:
         self._sock.close()
 
 
+class ShapedConnection(Connection):
+    """A connection whose traffic pays for an emulated link.
+
+    Chosen once, when the connection is made, so an unshaped run executes
+    exactly the plain :class:`Connection` code: the emulator costs nothing when
+    it is off.
+    """
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        op_timeout: float,
+        egress: tuple[LinkClock, ...],
+        ingress: LinkClock | None,
+        latency_s: float,
+    ) -> None:
+        super().__init__(sock, op_timeout)
+        self._egress = egress
+        self._ingress = ingress
+        self._latency_s = latency_s
+
+    def send(self, view: memoryview) -> None:
+        if self._latency_s:
+            time.sleep(self._latency_s)
+        for offset in range(0, len(view), _SHAPE_CHUNK):
+            chunk = view[offset : offset + _SHAPE_CHUNK]
+            now = time.perf_counter()
+            earliest = now if offset == 0 else now - _CATCH_UP_S
+            if self._egress:
+                _wait_until(max(clock.book(len(chunk), earliest) for clock in self._egress))
+            self._sock.sendall(chunk)
+
+    def recv_into(self, view: memoryview) -> None:
+        offset = 0
+        while offset < len(view):
+            n = self._sock.recv_into(view[offset:], len(view) - offset)
+            if n == 0:
+                raise PeerClosedError("peer closed connection mid-message")
+            if self._ingress is not None:
+                arrived = time.perf_counter()
+                _wait_until(self._ingress.book(n, arrived - n / self._ingress.rate))
+            offset += n
+
+
 class Mesh:
     """Establishes and owns the full connection mesh for one rank.
 
@@ -164,10 +329,19 @@ class Mesh:
         n_channels: int = 1,
         timeout: float = 60.0,
         op_timeout: float = DEFAULT_OP_TIMEOUT,
+        link: LinkModel | None = None,
     ) -> None:
         self.rank = rank
         self.world_size = world_size
         self.n_channels = n_channels
+        self.link = link if link is not None else LinkModel()
+        # One clock per direction for the whole rank: every connection and
+        # channel this rank owns shares the same link, in and out.
+        self._egress: LinkClock | None = None
+        self._ingress: LinkClock | None = None
+        if self.link.mbps:
+            self._egress = LinkClock(_mbps_to_bytes(self.link.mbps))
+            self._ingress = LinkClock(_mbps_to_bytes(self.link.mbps))
         self.conns: dict[int, list[Connection]] = {}
         self._partial: dict[tuple[int, int], Connection] = {}
         self._refused: list[str] = []
@@ -241,7 +415,7 @@ class Mesh:
                     sock, origin = listener.accept()
                 except TimeoutError:
                     continue
-                if self._admit(Connection(sock, self._op_timeout), origin):
+                if self._admit(self._connection(sock), origin):
                     accepted += 1
         finally:
             listener.close()
@@ -309,7 +483,7 @@ class Mesh:
                         f"rank {self.rank}: could not reach rank {peer} at {addr}"
                     ) from None
                 time.sleep(0.05)
-        conn = Connection(sock, self._op_timeout)
+        conn = self._connection(sock)
         try:
             hello = _HANDSHAKE.pack(
                 _MAGIC, PROTOCOL_VERSION, self.rank, channel, self._fingerprint
@@ -335,6 +509,18 @@ class Mesh:
         conn.set_timeout(self._op_timeout)
         with self._lock:
             self._partial[(peer, channel)] = conn
+
+    def _connection(self, sock: socket.socket) -> Connection:
+        if not self.link.shaped:
+            return Connection(sock, self._op_timeout)
+        egress: list[LinkClock] = []
+        if self._egress is not None:
+            egress.append(self._egress)
+        if self.link.flow_mbps:
+            egress.append(LinkClock(_mbps_to_bytes(self.link.flow_mbps)))
+        return ShapedConnection(
+            sock, self._op_timeout, tuple(egress), self._ingress, self.link.latency_us / 1e6
+        )
 
     def set_op_timeout(self, op_timeout: float | None) -> None:
         for channels in self.conns.values():
