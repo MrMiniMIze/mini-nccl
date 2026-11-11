@@ -4,8 +4,14 @@ Design notes:
 
 - Rank ``r`` listens on ``addrs[r]``; every rank dials all lower-numbered
   ranks, so each pair of ranks shares exactly ``n_channels`` connections.
-  An 8-byte handshake identifies the dialing peer and which channel the
-  socket belongs to.
+- Every connection opens with a handshake, and nothing is trusted until it
+  checks out: a magic number (is this mini-nccl at all?), a protocol version,
+  the dialer's rank and channel (in range, and not already connected), and a
+  fingerprint of the job's configuration (world size, channels, host list).
+  The acceptor answers with one status byte, so a refused dialer can say *why*
+  instead of failing later on its first collective. A connection that does not
+  produce a handshake promptly is dropped, so a port scanner or a stale process
+  from an earlier run cannot stall rendezvous.
 - **Channels** are independent connections between the same pair of ranks,
   the same idea NCCL uses to drive one collective over several parallel
   paths. A large collective is split across channels and each channel is
@@ -25,6 +31,7 @@ Design notes:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import socket
 import struct
 import threading
@@ -34,7 +41,26 @@ import torch
 
 from .errors import PeerClosedError, RendezvousError
 
-_HANDSHAKE = struct.Struct("!II")
+# magic, protocol version, dialer rank, dialer channel, job fingerprint.
+_HANDSHAKE = struct.Struct("!4sHIIQ")
+_MAGIC = b"MNCL"
+#: Bumped whenever the wire format changes, so mismatched builds refuse each
+#: other at rendezvous instead of misreading each other's bytes.
+PROTOCOL_VERSION = 1
+
+# The acceptor's one-byte answer to a handshake.
+_ACCEPTED = 0
+_REFUSALS = {
+    1: "it speaks a different protocol version",
+    2: "the job configuration differs (world size, channel count, or host list)",
+    3: "the claimed rank or channel is not one this rank expects to accept",
+    4: "that rank and channel are already connected",
+}
+_BAD_VERSION, _BAD_JOB, _BAD_IDENTITY, _DUPLICATE = 1, 2, 3, 4
+
+# A real peer sends its handshake immediately after connecting. Anything that
+# stays silent longer than this is not a peer, and must not hold up the others.
+_HANDSHAKE_TIMEOUT = 5.0
 
 # 2 MiB socket buffers: large enough that a ring step's chunk usually fits
 # in flight without stalling the sender on loopback or a LAN.
@@ -44,6 +70,17 @@ DEFAULT_OP_TIMEOUT = 300.0
 
 # How often the accepter checks whether the rendezvous has been abandoned.
 _ACCEPT_POLL_SECONDS = 0.5
+
+
+def job_fingerprint(world_size: int, n_channels: int, addrs: list[tuple[str, int]]) -> int:
+    """A 64-bit digest of what every rank must agree on before connecting.
+
+    The host list in particular has to be identical everywhere (docs/multinode.md),
+    and a disagreement used to surface as ranks quietly connecting to the wrong
+    peers. Hashing it into the handshake turns that into a named refusal.
+    """
+    canonical = repr((world_size, n_channels, [(str(h), int(p)) for h, p in addrs]))
+    return int.from_bytes(hashlib.blake2b(canonical.encode(), digest_size=8).digest(), "big")
 
 
 def byte_view(tensor: torch.Tensor) -> memoryview:
@@ -110,11 +147,13 @@ class Mesh:
         self.n_channels = n_channels
         self.conns: dict[int, list[Connection]] = {}
         self._partial: dict[tuple[int, int], Connection] = {}
+        self._refused: list[str] = []
         self._lock = threading.Lock()
         self._op_timeout = op_timeout
         self._stop = threading.Event()
         if world_size == 1:
             return
+        self._fingerprint = job_fingerprint(world_size, n_channels, addrs)
 
         host, port = addrs[rank]
         listener = socket.create_server((host, port), backlog=world_size * n_channels)
@@ -143,9 +182,12 @@ class Mesh:
                         {p for p in range(world_size) if p != rank}
                         - {p for p, _ in self._partial}
                     )
+                    refused = ""
+                    if self._refused:
+                        refused = "; refused " + "; ".join(self._refused)
                     raise RendezvousError(
                         f"rank {rank}: established {got}/{expected} connections; "
-                        f"no contact with ranks {missing}"
+                        f"no contact with ranks {missing}{refused}"
                     )
                 for peer in range(world_size):
                     if peer == rank:
@@ -173,18 +215,65 @@ class Mesh:
             accepted = 0
             while accepted < count and not self._stop.is_set():
                 try:
-                    sock, _ = listener.accept()
+                    sock, origin = listener.accept()
                 except TimeoutError:
                     continue
-                conn = Connection(sock, self._op_timeout)
-                raw = bytearray(_HANDSHAKE.size)
-                conn.recv_into(memoryview(raw))
-                peer, channel = _HANDSHAKE.unpack(raw)
-                with self._lock:
-                    self._partial[(peer, channel)] = conn
-                accepted += 1
+                if self._admit(Connection(sock, self._op_timeout), origin):
+                    accepted += 1
         finally:
             listener.close()
+
+    def _admit(self, conn: Connection, origin: tuple) -> bool:
+        """Check one incoming handshake, then file the connection or refuse it."""
+        where = f"{origin[0]}:{origin[1]}"
+        raw = bytearray(_HANDSHAKE.size)
+        conn.set_timeout(_HANDSHAKE_TIMEOUT)
+        try:
+            conn.recv_into(memoryview(raw))
+        except OSError:
+            conn.close()
+            self._note(f"{where}: no handshake within {_HANDSHAKE_TIMEOUT:.0f}s")
+            return False
+        magic, version, peer, channel, fingerprint = _HANDSHAKE.unpack(raw)
+        if magic != _MAGIC:
+            # Not mini-nccl at all, so there is nobody to explain anything to.
+            conn.close()
+            self._note(f"{where}: not a mini-nccl peer")
+            return False
+
+        with self._lock:
+            if version != PROTOCOL_VERSION:
+                status = _BAD_VERSION
+            elif fingerprint != self._fingerprint:
+                status = _BAD_JOB
+            elif not (self.rank < peer < self.world_size and 0 <= channel < self.n_channels):
+                status = _BAD_IDENTITY
+            elif (peer, channel) in self._partial:
+                status = _DUPLICATE
+            else:
+                status = _ACCEPTED
+                self._partial[(peer, channel)] = conn
+        try:
+            conn.send(memoryview(bytes([status])))
+        except OSError:
+            status = status or -1  # an accepted dialer that vanished mid-reply
+        if status == _ACCEPTED:
+            conn.set_timeout(self._op_timeout)
+            return True
+
+        with self._lock:
+            if self._partial.get((peer, channel)) is conn:
+                del self._partial[(peer, channel)]
+        conn.close()
+        reason = _REFUSALS.get(status, "it disconnected during the handshake")
+        if status == _BAD_VERSION:
+            reason += f" (protocol version {version}, expected {PROTOCOL_VERSION})"
+        self._note(f"{where} claiming rank {peer} channel {channel}: {reason}")
+        return False
+
+    def _note(self, refusal: str) -> None:
+        with self._lock:
+            self._refused.append(refusal)
 
     def _dial(self, peer: int, channel: int, addr: tuple[str, int], timeout: float) -> None:
         deadline = time.monotonic() + timeout
@@ -199,7 +288,29 @@ class Mesh:
                     ) from None
                 time.sleep(0.05)
         conn = Connection(sock, self._op_timeout)
-        conn.send(memoryview(_HANDSHAKE.pack(self.rank, channel)))
+        try:
+            hello = _HANDSHAKE.pack(
+                _MAGIC, PROTOCOL_VERSION, self.rank, channel, self._fingerprint
+            )
+            conn.send(memoryview(hello))
+            # Wait for the verdict. A slow acceptor may be busy dropping strays,
+            # so allow whatever remains of the rendezvous budget.
+            conn.set_timeout(max(deadline - time.monotonic(), _HANDSHAKE_TIMEOUT))
+            status = bytearray(1)
+            conn.recv_into(memoryview(status))
+        except OSError as exc:
+            conn.close()
+            raise RendezvousError(
+                f"rank {self.rank}: rank {peer} at {addr} did not complete the "
+                f"handshake ({exc})"
+            ) from None
+        if status[0] != _ACCEPTED:
+            conn.close()
+            reason = _REFUSALS.get(status[0], f"unknown status {status[0]}")
+            raise RendezvousError(
+                f"rank {self.rank}: rank {peer} at {addr} refused the connection: {reason}"
+            )
+        conn.set_timeout(self._op_timeout)
         with self._lock:
             self._partial[(peer, channel)] = conn
 

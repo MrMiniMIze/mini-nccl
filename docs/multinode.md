@@ -98,5 +98,8 @@ way `benchmarks/bench_ablation.py` derived the loopback ones.
   participating. Re-run with `MINI_NCCL_TRACE=1`, have each rank dump its
   recorder (`pg.recorder.dump(dir)`), collect the files, and run
   `python -m mini_nccl.diagnose <dir>` to find which rank diverged.
-- **Mismatched host lists**: ranks that disagree about the list will connect
-  to the wrong peers. The list must be byte-identical everywhere.
+- **"refused the connection: the job configuration differs"**: the ranks
+  disagree about the host list, the world size, or the channel count. The host
+  list must be byte-identical everywhere; rendezvous hashes it into the
+  handshake so a mismatch fails at startup, naming the refusal on both sides,
+  rather than connecting ranks to the wrong peers.

@@ -5,6 +5,15 @@ history has the detail.
 
 ## Unreleased
 
+- A peer whose connection drops or resets now raises `PeerClosedError`
+  carrying the same local state a timeout does. Before, only timeouts were
+  translated, and a dead peer surfaced as a bare `ConnectionResetError`.
+- Rendezvous validates every handshake: magic number, protocol version, the
+  claimed rank and channel, and a fingerprint of the job configuration. A
+  refused dialer is told why. A silent connection is dropped after 5 s instead
+  of holding the acceptor for the 300 s operation timeout, and a stray's bytes
+  can no longer be filed as a rank. Mismatched host lists now fail at startup
+  by name.
 - Check the README's numbers instead of maintaining them.
   `scripts/check_readme_claims.py` derives the test, module, mutation and
   protocol-member counts and the version from the code, fails naming the line

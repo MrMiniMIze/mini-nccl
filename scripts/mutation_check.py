@@ -201,11 +201,31 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         name="transport-handshake-identity",
         file="mini_nccl/transport.py",
-        old="        conn.send(memoryview(_HANDSHAKE.pack(self.rank, channel)))",
-        new="        conn.send(memoryview(_HANDSHAKE.pack(0, channel)))",
+        old="                _MAGIC, PROTOCOL_VERSION, self.rank, channel, self._fingerprint\n",
+        new="                _MAGIC, PROTOCOL_VERSION, 0, channel, self._fingerprint\n",
         breaks="every dialing rank claims to be rank 0, so connections are "
         "filed against the wrong peers",
         tests=["tests/test_collectives.py::test_collective_battery"],
+    ),
+    Mutation(
+        name="transport-handshake-no-timeout",
+        file="mini_nccl/transport.py",
+        old="        conn.set_timeout(_HANDSHAKE_TIMEOUT)\n",
+        new="        conn.set_timeout(self._op_timeout)\n",
+        breaks="the acceptor waits the full operation timeout for a handshake, so "
+        "one silent stray connection stalls rendezvous for every rank",
+        tests=["tests/test_transport.py::test_rendezvous_survives_stray_connections"],
+    ),
+    Mutation(
+        name="pg-raw-connection-errors",
+        file="mini_nccl/process_group.py",
+        old="            self._mesh.conns[dst][channel].send(byte_view(tensor))\n"
+        "        except OSError as exc:",
+        new="            self._mesh.conns[dst][channel].send(byte_view(tensor))\n"
+        "        except TimeoutError as exc:",
+        breaks="only timeouts are translated, so a dead peer surfaces as a bare "
+        "socket error with no rank or collective named",
+        tests=["tests/test_transport.py::test_dead_peer_raises_peer_closed_with_context"],
     ),
     # The diagnostic tooling needs its own mutations: it is the part of the
     # project whose whole job is to be right when everything else is wrong, and
