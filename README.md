@@ -29,9 +29,10 @@ where one optimization measured slower and therefore ships off, and [what
 loopback hides](#what-loopback-teaches-and-what-it-hides), where a measured
 bandwidth ratio explains all four negative results at once.
 
-Current release: **v0.9.0**. 78 tests across world sizes 1 to 8, 93% coverage,
-mypy clean, 18 of 18 injected defects caught, and three CI jobs (lint,
-mutation, and the suite on both Linux and Windows).
+Current release: **v0.9.0**. 78 tests across world sizes 1 to 8, 91% coverage
+without a GPU (CI fails below 90%), mypy clean, 18 of 18 injected defects
+caught, and four CI jobs: lint, mutation, a clean install of the built wheel,
+and the suite on Linux, Windows and macOS, on Python 3.10, 3.12 and 3.13.
 
 ## What this demonstrates
 
@@ -135,7 +136,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
 pytest -q                                        # 78 tests, world sizes 1-8
-mypy mini_nccl --ignore-missing-imports          # clean across 15 modules
+mypy mini_nccl                                   # clean across 15 modules
 python scripts/mutation_check.py                 # do the tests have teeth?
 
 python examples/train_gpt.py --world-size 4 --steps 200 --sample
@@ -799,9 +800,10 @@ pytest -q                    # 78 tests, ~7 min (process spawn dominates)
 pytest -q -m "not examples"   # skip the example smoke runs for a faster loop
 
 # Coverage needs multiprocessing awareness or it only sees the parent process
-# and reports about 24% against a real 93%.
+# and reports about 24% against a real 91% (measured without a GPU, so the
+# device path's CUDA-only branches are the main gap).
 COVERAGE_PROCESS_START=$PWD/pyproject.toml coverage run -m pytest -q
-coverage combine && coverage report
+coverage combine && coverage report --fail-under=90   # what CI enforces
 ```
 
 - **Collectives:** every collective x every algorithm x sum/max/min/prod x
@@ -901,10 +903,10 @@ Alongside those:
   uses. `ProcessGroup` and `SubGroup` both have to satisfy it, so
   "a subgroup is substitutable for the group it came from" is verified rather
   than asserted in prose.
-- **Coverage is 93%**, and the number itself was a lesson. The first run
-  reported 24%, because the tests spawn one process per rank and only the
-  parent was instrumented. A number that wrong is worse than none, so the
-  config now enables multiprocessing coverage (150 process files combined).
+- **Coverage is 91%** without a GPU, and the number itself was a lesson. The
+  first run reported 24%, because the tests spawn one process per rank and
+  only the parent was instrumented. A number that wrong is worse than none, so
+  the config now enables multiprocessing coverage, and CI fails below 90%.
 
 Three areas came back explicitly clean under review: the device path's
 cross-stream ordering (traced for 1, 2, 3, and N chunks and across ring-step

@@ -12,18 +12,26 @@ authors = [{ name = "MrMiniMIze" }]
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
+    # The transport reads and writes tensors through ``Tensor.numpy()`` (see
+    # ``byte_view`` in transport.py), so every send needs it. torch does not
+    # depend on numpy, and the CPU wheels do not pull it in.
+    "numpy",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
-    "numpy",
     "matplotlib",
     "ruff>=0.6",
+    "mypy>=1.8",
+    "coverage>=7.4",
 ]
 
 [tool.setuptools.packages.find]
 include = ["mini_nccl*"]
+
+[tool.setuptools.package-data]
+mini_nccl = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -31,6 +39,11 @@ addopts = "-ra"
 markers = [
     "examples: smoke-runs an example script in a subprocess (slower; deselect with -m 'not examples')",
 ]
+
+[tool.mypy]
+# torch ships its own types; matplotlib and the rest are only used outside
+# the package, but a stub-less import anywhere should not fail the check.
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 96

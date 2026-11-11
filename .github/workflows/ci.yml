@@ -14,11 +14,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff mypy
+      - name: Install torch (CPU) and package
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .[dev]
       - run: ruff check .
-      - name: Install torch (CPU) for type stubs
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: mypy mini_nccl --ignore-missing-imports
+      - run: mypy mini_nccl
 
   # Checks that the tests would fail if the library broke. --strict also fails
   # if a mutation can no longer be applied, so the checker cannot quietly rot
@@ -37,21 +38,75 @@ jobs:
           pip install -e .[dev]
       - run: python scripts/mutation_check.py --strict
 
+  # The test jobs always have the dev extra installed, so they cannot notice a
+  # runtime dependency declared only there. This installs the built wheel with
+  # no extras into a clean environment and moves real bytes through it, which
+  # is the check that would have caught numpy being missing from the runtime
+  # dependencies.
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the wheel
+        run: |
+          pip install build
+          python -m build --wheel --outdir dist
+      - name: Install it with no extras into a clean environment
+        run: |
+          python -m venv "$RUNNER_TEMP/clean"
+          "$RUNNER_TEMP/clean/bin/pip" install torch --index-url https://download.pytorch.org/whl/cpu
+          "$RUNNER_TEMP/clean/bin/pip" install dist/*.whl
+      - name: Run a 2-rank all-reduce against the installed package
+        working-directory: ${{ runner.temp }}
+        run: '"$RUNNER_TEMP/clean/bin/python" "$GITHUB_WORKSPACE/scripts/smoke_install.py"'
+
   test:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.12"]
+        include:
+          # Coverage runs on one leg only: it is slower, and the number does
+          # not depend on the platform.
+          - os: ubuntu-latest
+            python: "3.12"
+            coverage: true
+          # The oldest and newest Pythons the package claims to support.
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.13"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: Install torch (CPU) and package
+          python-version: ${{ matrix.python }}
+      - name: Install torch (CPU)
+        shell: bash
         run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e .[dev]
+          # The CPU index is for Linux and Windows; PyPI's macOS wheels are
+          # already CPU (plus MPS, which this project does not use).
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            pip install torch
+          else
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
+          fi
+      - run: pip install -e .[dev]
       - name: Run tests
+        if: ${{ !matrix.coverage }}
         run: pytest -q
+      # The tests spawn one process per rank, so coverage has to follow them
+      # into the children or it reports about 24% against the real number.
+      - name: Run tests with coverage
+        if: ${{ matrix.coverage }}
+        run: |
+          COVERAGE_PROCESS_START="$PWD/pyproject.toml" coverage run -m pytest -q
+          coverage combine
+          coverage report --fail-under=90
