@@ -210,11 +210,20 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         name="transport-handshake-no-timeout",
         file="mini_nccl/transport.py",
-        old="        conn.set_timeout(_HANDSHAKE_TIMEOUT)\n",
-        new="        conn.set_timeout(self._op_timeout)\n",
+        old="conn.recv_by(memoryview(raw), time.monotonic() + _HANDSHAKE_TIMEOUT)",
+        new="conn.recv_by(memoryview(raw), time.monotonic() + self._op_timeout)",
         breaks="the acceptor waits the full operation timeout for a handshake, so "
         "one silent stray connection stalls rendezvous for every rank",
         tests=["tests/test_transport.py::test_rendezvous_survives_stray_connections"],
+    ),
+    Mutation(
+        name="transport-handshake-per-read-timeout",
+        file="mini_nccl/transport.py",
+        old="conn.recv_by(memoryview(raw), time.monotonic() + _HANDSHAKE_TIMEOUT)",
+        new="conn.set_timeout(_HANDSHAKE_TIMEOUT) or conn.recv_into(memoryview(raw))",
+        breaks="the handshake budget restarts on every read, so a client "
+        "trickling its handshake one byte at a time holds the acceptor",
+        tests=["tests/test_transport.py::test_a_trickled_handshake_cannot_outlast_its_deadline"],
     ),
     Mutation(
         name="pg-raw-connection-errors",

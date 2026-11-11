@@ -29,8 +29,8 @@ where one optimization measured slower and therefore ships off, and [what
 loopback hides](#what-loopback-teaches-and-what-it-hides), where a measured
 bandwidth ratio explains all four negative results at once.
 
-Current release: **v0.9.0**. 88 tests across world sizes 1 to 8, 91% coverage
-without a GPU (CI fails below 90%), mypy clean, 21 of 21 injected defects
+Current release: **v0.9.0**. 89 tests across world sizes 1 to 8, 91% coverage
+without a GPU (CI fails below 90%), mypy clean, 22 of 22 injected defects
 caught, and four CI jobs: lint, mutation, a clean install of the built wheel,
 and the suite on Linux, Windows and macOS, on Python 3.10, 3.12 and 3.13.
 
@@ -135,7 +135,7 @@ flowchart TB
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e .[dev]
 
-pytest -q                                        # 88 tests, world sizes 1-8
+pytest -q                                        # 89 tests, world sizes 1-8
 mypy mini_nccl                                   # clean across 15 modules
 python scripts/mutation_check.py                 # do the tests have teeth?
 
@@ -715,9 +715,10 @@ carrying a magic number, a protocol version, the dialer's rank and channel, and
 a fingerprint of the job's configuration (world size, channels, host list).
 Anything that fails a check is refused, and both sides say why: ranks that
 disagree about the host list fail at startup with "the job configuration
-differs", instead of connecting to the wrong peers. A connection that sends no
-handshake within five seconds is dropped, so a port scanner or a stale process
-from an earlier run cannot stall the job.
+differs", instead of connecting to the wrong peers. A connection that has not
+delivered its whole handshake within five seconds is dropped, so a port scanner,
+a stale process from an earlier run, or a client trickling one byte at a time
+cannot stall the job.
 
 **A flight recorder.** With `MINI_NCCL_TRACE=1` (or `run(..., trace_dir=...)`)
 every collective is sequence-numbered per channel and timed. Because ranks
@@ -807,7 +808,7 @@ rigorous version of this demonstration; this is the fun one.
 ## Testing
 
 ```
-pytest -q                    # 88 tests, ~7 min (process spawn dominates)
+pytest -q                    # 89 tests, ~7 min (process spawn dominates)
 pytest -q -m "not examples"   # skip the example smoke runs for a faster loop
 
 # Coverage needs multiprocessing awareness or it only sees the parent process
@@ -861,8 +862,9 @@ coverage combine && coverage report --fail-under=90   # what CI enforces
 - **Transport:** full-duplex ring rotation deadlock test, zero-copy
   invariants, a peer dying mid-send and mid-receive (each must raise
   `PeerClosedError` naming the rank and collective), and rendezvous against a
-  silent stray connection, a garbage one, a mismatched job configuration and
-  a wrong protocol version. Each of those tests was watched failing against the
+  silent stray connection, a garbage one, one that trickles its handshake a
+  byte at a time, a mismatched job configuration and a wrong protocol
+  version. Each of those tests was watched failing against the
   code before the fix.
 - **Faults:** a rank dying mid-collective must surface in seconds; a desync
   must produce a timeout plus a diagnosis naming the divergent collective,
@@ -943,7 +945,7 @@ vacuous this project, that question needed an answer rather than an assumption.
 
 `scripts/mutation_check.py` breaks the library on purpose, one edit at a time,
 and checks the suite notices. Every mutation is a mistake a person could make.
-It runs in CI, and all 21 real mutations are caught (20 on a GPU-less
+It runs in CI, and all 22 real mutations are caught (21 on a GPU-less
 runner, where the device one is skipped rather than counted as missed):
 
 | mutation | what it breaks | caught by |
@@ -965,6 +967,7 @@ runner, where the device one is skipped rather than counted as missed):
 | `transport-partial-recv` | a receive stops looping, truncating any large message | `test_collective_battery` |
 | `transport-handshake-identity` | every dialer claims to be rank 0, misfiling connections | `test_collective_battery` |
 | `transport-handshake-no-timeout` | one silent stray connection stalls rendezvous for every rank | `test_rendezvous_survives_stray_connections` |
+| `transport-handshake-per-read-timeout` | the handshake budget restarts on every byte, so a trickling client holds the acceptor | `test_a_trickled_handshake_cannot_outlast_its_deadline` |
 | `pg-raw-connection-errors` | a dead peer surfaces as a bare socket error naming nothing | `test_dead_peer_raises_peer_closed_with_context` |
 | `diagnose-blind-to-divergence` | the desync analysis never reports one, so a hung job looks healthy | `test_desync_times_out_with_diagnosis` |
 | `diagnose-straggler-inverted` | blames the ranks that waited instead of the one they waited for | `test_diagnose_names_a_straggler` |

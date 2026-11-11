@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import socket
@@ -211,6 +212,50 @@ def test_rendezvous_survives_stray_connections() -> None:
         assert bytes(got) == b"hello"
     finally:
         for m in meshes:
+            if isinstance(m, Mesh):
+                m.close()
+
+
+def test_a_trickled_handshake_cannot_outlast_its_deadline(monkeypatch) -> None:
+    """The handshake budget covers the whole handshake, not each read of it.
+
+    A per-read timeout restarts every time a byte arrives, so a client that
+    trickles one byte at a time (slowloris) could hold the acceptor for the
+    handshake's length times the budget, stalling every real rank behind it.
+    """
+    from mini_nccl import transport
+
+    monkeypatch.setattr(transport, "_HANDSHAKE_TIMEOUT", 1.0)
+    addrs = [("127.0.0.1", p) for p in _free_ports(2)]
+    results: dict[int, object] = {}
+    rank0 = threading.Thread(
+        target=lambda: results.update(_build_meshes(addrs, [(0, 1)], timeout=6.0))
+    )
+    rank0.start()
+
+    slow = _connect_when_listening(addrs[0])
+    stop = threading.Event()
+
+    def trickle() -> None:
+        # One byte every 0.4 s: never silent for the 1 s budget, and the 22-byte
+        # handshake would take 8.8 s, past the 6 s rendezvous.
+        with contextlib.suppress(OSError):
+            while not stop.is_set():
+                slow.send(b"M")
+                stop.wait(0.4)
+
+    trickler = threading.Thread(target=trickle, daemon=True)
+    trickler.start()
+    try:
+        results.update(_build_meshes(addrs, [(1, 1)], timeout=6.0))
+        rank0.join(15)
+    finally:
+        stop.set()
+        slow.close()
+    try:
+        assert all(isinstance(results[r], Mesh) for r in (0, 1)), results
+    finally:
+        for m in results.values():
             if isinstance(m, Mesh):
                 m.close()
 

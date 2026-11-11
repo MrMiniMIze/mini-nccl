@@ -14,6 +14,10 @@ history has the detail.
   of holding the acceptor for the 300 s operation timeout, and a stray's bytes
   can no longer be filed as a rank. Mismatched host lists now fail at startup
   by name.
+- The handshake's 5 s budget covers the whole handshake rather than each read
+  of it, so a client trickling one byte at a time can no longer hold the
+  acceptor indefinitely (found by an automated security review of the change
+  above).
 - Check the README's numbers instead of maintaining them.
   `scripts/check_readme_claims.py` derives the test, module, mutation and
   protocol-member counts and the version from the code, fails naming the line

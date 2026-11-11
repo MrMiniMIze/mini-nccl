@@ -59,7 +59,11 @@ _REFUSALS = {
 _BAD_VERSION, _BAD_JOB, _BAD_IDENTITY, _DUPLICATE = 1, 2, 3, 4
 
 # A real peer sends its handshake immediately after connecting. Anything that
-# stays silent longer than this is not a peer, and must not hold up the others.
+# has not delivered all of it within this budget is not a peer, and must not
+# hold up the others. Strays are admitted one at a time, so each one can still
+# delay rendezvous by up to this much: the protection is against stray and
+# stale connections, not a determined adversary, since rendezvous is not
+# authenticated (nor are NCCL's or gloo's).
 _HANDSHAKE_TIMEOUT = 5.0
 
 # 2 MiB socket buffers: large enough that a ring step's chunk usually fits
@@ -120,6 +124,25 @@ class Connection:
                 raise PeerClosedError("peer closed connection mid-message")
             offset += n
             remaining -= n
+
+    def recv_by(self, view: memoryview, deadline: float) -> None:
+        """Fill ``view`` before ``deadline`` (``time.monotonic()``), or raise.
+
+        A socket timeout restarts on every read that returns data, so a peer
+        trickling one byte at a time never trips it. Rendezvous reads the
+        handshake through this instead, against one deadline for the whole
+        message. Not used on the data path, which wants no per-read clock.
+        """
+        offset = 0
+        while offset < len(view):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("deadline passed before the message completed")
+            self._sock.settimeout(remaining)
+            n = self._sock.recv_into(view[offset:], len(view) - offset)
+            if n == 0:
+                raise PeerClosedError("peer closed connection mid-message")
+            offset += n
 
     def close(self) -> None:
         with contextlib.suppress(OSError):  # already closed by the peer
@@ -227,9 +250,8 @@ class Mesh:
         """Check one incoming handshake, then file the connection or refuse it."""
         where = f"{origin[0]}:{origin[1]}"
         raw = bytearray(_HANDSHAKE.size)
-        conn.set_timeout(_HANDSHAKE_TIMEOUT)
         try:
-            conn.recv_into(memoryview(raw))
+            conn.recv_by(memoryview(raw), time.monotonic() + _HANDSHAKE_TIMEOUT)
         except OSError:
             conn.close()
             self._note(f"{where}: no handshake within {_HANDSHAKE_TIMEOUT:.0f}s")
